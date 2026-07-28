@@ -8,5 +8,13 @@
     "maxDimension": 2560,
     // Допустимый диапазон JPEG quality: 1–100.
     "quality": 83
+  },
+  // Подготовка видео перед загрузкой в хранилища.
+  "videoConverter": {
+    "inputDir": "./video-input",
+    "outputDir": "./video-output",
+    "maxDimension": 2560,
+    // Допустимый диапазон quality: 1–100 (маппится в libx264 CRF).
+    "quality": 83
   }
 }

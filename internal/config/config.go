@@ -10,10 +10,12 @@ import (
 	"path/filepath"
 
 	imageconverter "all-for-one-drive/internal/image-converter"
+	videoconverter "all-for-one-drive/internal/video-converter"
 )
 
 type Config struct {
 	ImageConverter imageconverter.Config `json:"imageConverter"`
+	VideoConverter videoconverter.Config `json:"videoConverter"`
 }
 
 // Load reads a JSONC config and resolves module directory paths relative to it.
@@ -44,6 +46,8 @@ func Load(path string) (Config, error) {
 	baseDir := filepath.Dir(configPath)
 	result.ImageConverter.InputDir = resolvePath(baseDir, result.ImageConverter.InputDir)
 	result.ImageConverter.OutputDir = resolvePath(baseDir, result.ImageConverter.OutputDir)
+	result.VideoConverter.InputDir = resolvePath(baseDir, result.VideoConverter.InputDir)
+	result.VideoConverter.OutputDir = resolvePath(baseDir, result.VideoConverter.OutputDir)
 	return result, nil
 }
 
