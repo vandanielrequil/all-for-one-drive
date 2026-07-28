@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"all-for-one-drive/internal/applog"
 	"github.com/disintegration/imaging"
 )
 
@@ -50,6 +51,7 @@ type Converter struct {
 }
 
 func New(config Config) (*Converter, error) {
+	applog.Entry("image-converter", "New", "inputDir=%s outputDir=%s maxDimension=%d quality=%d", config.InputDir, config.OutputDir, config.MaxDimension, config.Quality)
 	if strings.TrimSpace(config.InputDir) == "" {
 		return nil, errors.New("inputDir is required")
 	}
@@ -83,6 +85,7 @@ func New(config Config) (*Converter, error) {
 // ProcessDir recursively converts supported images and reports each result.
 // Existing output files are skipped, which makes repeated runs non-destructive.
 func (c *Converter) ProcessDir(ctx context.Context, report func(Progress)) (Summary, error) {
+	applog.Entry("image-converter", "ProcessDir", "inputDir=%s outputDir=%s", c.config.InputDir, c.config.OutputDir)
 	files, err := c.sourceFiles()
 	if err != nil {
 		return Summary{}, err
@@ -120,6 +123,7 @@ func (c *Converter) ProcessDir(ctx context.Context, report func(Progress)) (Summ
 }
 
 func (c *Converter) sourceFiles() ([]string, error) {
+	applog.Entry("image-converter", "sourceFiles", "inputDir=%s", c.config.InputDir)
 	info, err := os.Stat(c.config.InputDir)
 	if err != nil {
 		return nil, fmt.Errorf("open input directory: %w", err)
@@ -151,6 +155,7 @@ func (c *Converter) sourceFiles() ([]string, error) {
 }
 
 func (c *Converter) convertFile(sourcePath string) (outputPath string, skipped bool, err error) {
+	applog.Entry("image-converter", "convertFile", "sourcePath=%s", sourcePath)
 	relativePath, err := filepath.Rel(c.config.InputDir, sourcePath)
 	if err != nil {
 		return "", false, fmt.Errorf("resolve relative path: %w", err)
@@ -206,6 +211,7 @@ func (c *Converter) convertFile(sourcePath string) (outputPath string, skipped b
 }
 
 func isSupportedImage(path string) bool {
+	applog.Entry("image-converter", "isSupportedImage", "path=%s", path)
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff", ".bmp":
 		return true
@@ -215,5 +221,6 @@ func isSupportedImage(path string) bool {
 }
 
 func samePath(left, right string) bool {
+	applog.Entry("image-converter", "samePath", "left=%s right=%s", left, right)
 	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 }

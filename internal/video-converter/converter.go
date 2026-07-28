@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"all-for-one-drive/internal/applog"
 )
 
 const (
@@ -51,6 +53,7 @@ type Converter struct {
 }
 
 func New(config Config) (*Converter, error) {
+	applog.Entry("video-converter", "New", "inputDir=%s outputDir=%s maxDimension=%d quality=%d", config.InputDir, config.OutputDir, config.MaxDimension, config.Quality)
 	if strings.TrimSpace(config.InputDir) == "" {
 		return nil, errors.New("inputDir is required")
 	}
@@ -93,6 +96,7 @@ func New(config Config) (*Converter, error) {
 // ProcessDir recursively converts supported videos and reports each result.
 // Existing output files are skipped, which makes repeated runs non-destructive.
 func (c *Converter) ProcessDir(ctx context.Context, report func(Progress)) (Summary, error) {
+	applog.Entry("video-converter", "ProcessDir", "inputDir=%s outputDir=%s", c.config.InputDir, c.config.OutputDir)
 	files, err := c.sourceFiles()
 	if err != nil {
 		return Summary{}, err
@@ -130,6 +134,7 @@ func (c *Converter) ProcessDir(ctx context.Context, report func(Progress)) (Summ
 }
 
 func (c *Converter) sourceFiles() ([]string, error) {
+	applog.Entry("video-converter", "sourceFiles", "inputDir=%s", c.config.InputDir)
 	info, err := os.Stat(c.config.InputDir)
 	if err != nil {
 		return nil, fmt.Errorf("open input directory: %w", err)
@@ -161,6 +166,7 @@ func (c *Converter) sourceFiles() ([]string, error) {
 }
 
 func (c *Converter) convertFile(ctx context.Context, sourcePath string) (outputPath string, skipped bool, err error) {
+	applog.Entry("video-converter", "convertFile", "sourcePath=%s", sourcePath)
 	relativePath, err := filepath.Rel(c.config.InputDir, sourcePath)
 	if err != nil {
 		return "", false, fmt.Errorf("resolve relative path: %w", err)
@@ -199,6 +205,7 @@ func (c *Converter) convertFile(ctx context.Context, sourcePath string) (outputP
 }
 
 func (c *Converter) runFFmpeg(ctx context.Context, sourcePath, outputPath string) error {
+	applog.Entry("video-converter", "runFFmpeg", "sourcePath=%s outputPath=%s", sourcePath, outputPath)
 	width, height, err := c.probeVideoSize(ctx, sourcePath)
 	if err != nil {
 		return fmt.Errorf("probe video: %w", err)
@@ -251,6 +258,7 @@ func (c *Converter) runFFmpeg(ctx context.Context, sourcePath, outputPath string
 }
 
 func (c *Converter) probeVideoSize(ctx context.Context, sourcePath string) (int, int, error) {
+	applog.Entry("video-converter", "probeVideoSize", "sourcePath=%s", sourcePath)
 	cmd := exec.CommandContext(ctx, c.ffprobe,
 		"-v", "error",
 		"-select_streams", "v:0",
@@ -279,6 +287,7 @@ func (c *Converter) probeVideoSize(ctx context.Context, sourcePath string) (int,
 
 // qualityToCRF maps config quality (1-100) to libx264 CRF (lower is better).
 func qualityToCRF(quality int) int {
+	applog.Entry("video-converter", "qualityToCRF", "quality=%d", quality)
 	crf := 51 - int(float64(quality)*0.37)
 	if crf < 0 {
 		return 0
@@ -290,6 +299,7 @@ func qualityToCRF(quality int) int {
 }
 
 func isSupportedVideo(path string) bool {
+	applog.Entry("video-converter", "isSupportedVideo", "path=%s", path)
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg", ".3gp":
 		return true
@@ -299,5 +309,6 @@ func isSupportedVideo(path string) bool {
 }
 
 func samePath(left, right string) bool {
+	applog.Entry("video-converter", "samePath", "left=%s right=%s", left, right)
 	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 }

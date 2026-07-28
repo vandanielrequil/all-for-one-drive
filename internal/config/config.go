@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"all-for-one-drive/internal/applog"
+	"all-for-one-drive/internal/archiver"
 	imageconverter "all-for-one-drive/internal/image-converter"
 	videoconverter "all-for-one-drive/internal/video-converter"
 )
@@ -16,10 +18,12 @@ import (
 type Config struct {
 	ImageConverter imageconverter.Config `json:"imageConverter"`
 	VideoConverter videoconverter.Config `json:"videoConverter"`
+	Archiver       archiver.Config       `json:"archiver"`
 }
 
 // Load reads a JSONC config and resolves module directory paths relative to it.
 func Load(path string) (Config, error) {
+	applog.Entry("config", "Load", "path=%s", path)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
@@ -48,10 +52,12 @@ func Load(path string) (Config, error) {
 	result.ImageConverter.OutputDir = resolvePath(baseDir, result.ImageConverter.OutputDir)
 	result.VideoConverter.InputDir = resolvePath(baseDir, result.VideoConverter.InputDir)
 	result.VideoConverter.OutputDir = resolvePath(baseDir, result.VideoConverter.OutputDir)
+	result.Archiver.OutputDir = resolvePath(baseDir, result.Archiver.OutputDir)
 	return result, nil
 }
 
 func ensureEOF(decoder *json.Decoder) error {
+	applog.Entry("config", "ensureEOF", "start")
 	var extra any
 	err := decoder.Decode(&extra)
 	if errors.Is(err, io.EOF) {
@@ -64,6 +70,7 @@ func ensureEOF(decoder *json.Decoder) error {
 }
 
 func resolvePath(baseDir, path string) string {
+	applog.Entry("config", "resolvePath", "baseDir=%s path=%s", baseDir, path)
 	if path == "" || filepath.IsAbs(path) {
 		return path
 	}
@@ -71,6 +78,7 @@ func resolvePath(baseDir, path string) string {
 }
 
 func stripComments(input []byte) ([]byte, error) {
+	applog.Entry("config", "stripComments", "bytes=%d", len(input))
 	output := make([]byte, 0, len(input))
 	inString := false
 	escaped := false

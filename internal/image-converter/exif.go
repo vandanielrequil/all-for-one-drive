@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+
+	"all-for-one-drive/internal/applog"
 )
 
 var (
@@ -16,6 +18,7 @@ var (
 // preserveEXIF copies EXIF APP1 segments from a JPEG source into the newly
 // encoded JPEG. image/jpeg intentionally does not preserve metadata itself.
 func preserveEXIF(sourcePath, outputPath string) error {
+	applog.Entry("image-converter", "preserveEXIF", "sourcePath=%s outputPath=%s", sourcePath, outputPath)
 	source, err := os.ReadFile(sourcePath)
 	if err != nil {
 		return err
@@ -56,6 +59,7 @@ func preserveEXIF(sourcePath, outputPath string) error {
 }
 
 func extractEXIFSegments(data []byte) ([][]byte, error) {
+	applog.Entry("image-converter", "extractEXIFSegments", "bytes=%d", len(data))
 	if !bytes.HasPrefix(data, jpegSOI) {
 		return nil, nil
 	}
