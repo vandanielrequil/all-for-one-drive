@@ -167,8 +167,12 @@ func run() (runErr error) {
 	); err != nil {
 		return fmt.Errorf("upload files: %w", err)
 	}
-	if !shouldArchive {
-		if err := clearUploadDirectory(globalConfig.Rclone.UploadDir); err != nil {
+	if shouldArchive {
+		if err := clearDirectory(globalConfig.Archiver.OutputDir); err != nil {
+			return fmt.Errorf("clear archive output directory: %w", err)
+		}
+	} else {
+		if err := clearDirectory(globalConfig.Rclone.UploadDir); err != nil {
 			return fmt.Errorf("clear upload staging directory: %w", err)
 		}
 	}
@@ -240,17 +244,17 @@ func stageConvertedFiles(uploadDir string, sourceDirs map[string]string) error {
 	return nil
 }
 
-func clearUploadDirectory(uploadDir string) error {
+func clearDirectory(path string) error {
 	applog.Entry(
 		"convert-and-upload",
-		"clearUploadDirectory",
-		"uploadDir=%s",
-		uploadDir,
+		"clearDirectory",
+		"path=%s",
+		path,
 	)
-	if err := os.RemoveAll(uploadDir); err != nil {
+	if err := os.RemoveAll(path); err != nil {
 		return err
 	}
-	return os.MkdirAll(uploadDir, 0o755)
+	return os.MkdirAll(path, 0o755)
 }
 
 func configPathNextToExecutable() (string, error) {
