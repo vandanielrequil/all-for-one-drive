@@ -19,6 +19,8 @@ import (
 	"unicode"
 
 	"all-for-one-drive/internal/applog"
+	"all-for-one-drive/internal/oauth"
+	"all-for-one-drive/internal/twofactor"
 )
 
 type Config struct {
@@ -35,9 +37,15 @@ type Provider struct {
 }
 
 type Account struct {
-	Name     string            `json:"name"`
-	RootPath string            `json:"rootPath"`
-	Options  map[string]string `json:"options"`
+	Name      string            `json:"name"`
+	RootPath  string            `json:"rootPath"`
+	Options   map[string]string `json:"options"`
+	OAuth     *OAuthConfig      `json:"oauth,omitempty"`
+	TwoFactor *twofactor.Config `json:"twoFactor,omitempty"`
+}
+
+type OAuthConfig struct {
+	TokenFile string `json:"tokenFile"`
 }
 
 type Target struct {
@@ -71,6 +79,8 @@ type remote struct {
 	cloudName   string
 	apiKey      string
 	apiSecret   string
+	tokenFile   string
+	twoFactor   *twofactor.Config
 }
 
 type uploadFile struct {
@@ -90,7 +100,7 @@ type cloudinaryUsage struct {
 	} `json:"credits"`
 }
 
-func New(config Config) (*Client, error) {
+func New(ctx context.Context, config Config) (*Client, error) {
 	applog.Entry("rclone", "New", "providers=%d", len(config.Providers))
 	if len(config.Providers) == 0 {
 		return nil, errors.New("providers must not be empty")
@@ -102,6 +112,9 @@ func New(config Config) (*Client, error) {
 	binary, err := exec.LookPath("rclone")
 	if err != nil {
 		return nil, errors.New("rclone not found in PATH")
+	}
+	if err := prepareOAuthTokens(ctx, binary, config); err != nil {
+		return nil, err
 	}
 	remotes, _, err := buildConfig(config)
 	if err != nil {
@@ -152,6 +165,57 @@ func New(config Config) (*Client, error) {
 	}, nil
 }
 
+func prepareOAuthTokens(ctx context.Context, binary string, config Config) error {
+	applog.Entry("rclone", "prepareOAuthTokens", "providers=%d", len(config.Providers))
+	for providerIndex := range config.Providers {
+		provider := &config.Providers[providerIndex]
+		for accountIndex := range provider.Accounts {
+			account := &provider.Accounts[accountIndex]
+			if account.TwoFactor != nil {
+				if _, err := twofactor.GenerateAndWrite(*account.TwoFactor); err != nil {
+					return fmt.Errorf(
+						"generate TOTP for provider %q account %q: %w",
+						provider.Name,
+						account.Name,
+						err,
+					)
+				}
+			}
+			if account.OAuth == nil {
+				continue
+			}
+			if strings.TrimSpace(account.OAuth.TokenFile) == "" {
+				return fmt.Errorf(
+					"provider %q account %q OAuth tokenFile is required",
+					provider.Name,
+					account.Name,
+				)
+			}
+			if account.Options == nil {
+				account.Options = make(map[string]string)
+			}
+			token, err := oauth.EnsureRcloneToken(
+				ctx,
+				binary,
+				provider.Type,
+				account.Options["client_id"],
+				account.Options["client_secret"],
+				account.OAuth.TokenFile,
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"authorize provider %q account %q: %w",
+					provider.Name,
+					account.Name,
+					err,
+				)
+			}
+			account.Options["token"] = token
+		}
+	}
+	return nil
+}
+
 func createRcloneConfig(binary, configPath string, config Config) error {
 	applog.Entry(
 		"rclone",
@@ -183,6 +247,9 @@ func createRcloneConfig(binary, configPath string, config Config) error {
 			}
 			for _, key := range optionKeys {
 				args = append(args, key, account.Options[key])
+			}
+			if strings.TrimSpace(account.Options["token"]) != "" {
+				args = append(args, "config_refresh_token", "false")
 			}
 			args = append(args, "--obscure", "--no-output")
 
@@ -216,12 +283,71 @@ func (c *Client) Close() error {
 	if c.configPath == "" {
 		return nil
 	}
-	err := os.Remove(c.configPath)
+	persistErr := c.persistOAuthTokens()
+	removeErr := os.Remove(c.configPath)
 	c.configPath = ""
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove temporary rclone config: %w", err)
+	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		removeErr = fmt.Errorf("remove temporary rclone config: %w", removeErr)
+	} else {
+		removeErr = nil
 	}
-	return nil
+	return errors.Join(persistErr, removeErr)
+}
+
+func (c *Client) persistOAuthTokens() error {
+	content, err := os.ReadFile(c.configPath)
+	if err != nil {
+		return fmt.Errorf("read rclone config for OAuth token persistence: %w", err)
+	}
+	var result error
+	for target, selected := range c.remotes {
+		if selected.tokenFile == "" {
+			continue
+		}
+		token, found := rcloneConfigOption(content, selected.name, "token")
+		if !found {
+			result = errors.Join(
+				result,
+				fmt.Errorf(
+					"persist OAuth token for %q/%q: token is missing",
+					target.Provider,
+					target.Account,
+				),
+			)
+			continue
+		}
+		if err := oauth.SaveToken(selected.tokenFile, token); err != nil {
+			result = errors.Join(
+				result,
+				fmt.Errorf(
+					"persist OAuth token for %q/%q: %w",
+					target.Provider,
+					target.Account,
+					err,
+				),
+			)
+		}
+	}
+	return result
+}
+
+func rcloneConfigOption(content []byte, section string, option string) (string, bool) {
+	currentSection := ""
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			currentSection = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		if currentSection != section {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if found && strings.EqualFold(strings.TrimSpace(key), option) {
+			return strings.TrimSpace(value), true
+		}
+	}
+	return "", false
 }
 
 // PreCheck checks authentication and available space for every configured account.
@@ -339,8 +465,9 @@ func (c *Client) Upload(
 
 	remoteRoot := joinRemotePath(selected.rootPath, destination)
 	remoteDirectory := selected.name + ":" + remoteRoot
-	if err := c.runStreaming(
+	if err := c.runStreamingForRemote(
 		ctx,
+		selected,
 		"Upload.mkdir",
 		"--config", c.configPath,
 		"mkdir", remoteDirectory,
@@ -362,8 +489,9 @@ func (c *Client) Upload(
 				relativeDirectory,
 			)
 			if _, exists := createdDirectories[fileDirectory]; !exists {
-				if err := c.runStreaming(
+				if err := c.runStreamingForRemote(
 					ctx,
+					selected,
 					"Upload.mkdir",
 					"--config", c.configPath,
 					"mkdir", fileDirectory,
@@ -382,7 +510,7 @@ func (c *Client) Upload(
 			file.localPath,
 			fileDirectory,
 		}
-		if err := c.runStreaming(ctx, "Upload", args...); err != nil {
+		if err := c.runStreamingForRemote(ctx, selected, "Upload", args...); err != nil {
 			return fmt.Errorf("upload %q to %q: %w", file.localPath, fileDirectory, err)
 		}
 	}
@@ -484,7 +612,7 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 			"step=cloudinary-mkdir start remote=%s",
 			probePath,
 		)
-		_, err = c.runCapture(ctx, "-vv", "mkdir", probePath)
+		_, err = c.runCaptureForRemote(ctx, selected, "-vv", "mkdir", probePath)
 		if err != nil {
 			applog.Entry(
 				"rclone",
@@ -507,7 +635,7 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 	// Check the remote root: configured upload folders may not exist yet.
 	remotePath := selected.name + ":"
 	applog.Entry("rclone", "checkRemote", "step=about start remote=%s", remotePath)
-	output, err := c.runCapture(ctx, "-vv", "about", "--json", remotePath)
+	output, err := c.runCaptureForRemote(ctx, selected, "-vv", "about", "--json", remotePath)
 	if err == nil {
 		applog.Entry("rclone", "checkRemote", "step=about success responseBytes=%d", len(output))
 		var remoteQuota quota
@@ -524,7 +652,15 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 
 	// Some backends authenticate correctly but do not implement About.
 	applog.Entry("rclone", "checkRemote", "step=lsd start remote=%s maxDepth=1", remotePath)
-	_, listErr := c.runCapture(ctx, "-vv", "lsd", "--max-depth", "1", remotePath)
+	_, listErr := c.runCaptureForRemote(
+		ctx,
+		selected,
+		"-vv",
+		"lsd",
+		"--max-depth",
+		"1",
+		remotePath,
+	)
 	if listErr == nil {
 		applog.Entry("rclone", "checkRemote", "step=lsd success login=OK")
 		result.LoginOK = true
@@ -575,6 +711,49 @@ func (c *Client) fetchCloudinaryUsage(
 		return cloudinaryUsage{}, fmt.Errorf("decode Cloudinary usage: %w", err)
 	}
 	return usage, nil
+}
+
+func (c *Client) runCaptureForRemote(
+	ctx context.Context,
+	selected remote,
+	args ...string,
+) ([]byte, error) {
+	twoFactorArgs, err := rcloneTwoFactorArgs(selected)
+	if err != nil {
+		return nil, err
+	}
+	return c.runCapture(ctx, append(twoFactorArgs, args...)...)
+}
+
+func (c *Client) runStreamingForRemote(
+	ctx context.Context,
+	selected remote,
+	function string,
+	args ...string,
+) error {
+	twoFactorArgs, err := rcloneTwoFactorArgs(selected)
+	if err != nil {
+		return err
+	}
+	return c.runStreaming(ctx, function, append(twoFactorArgs, args...)...)
+}
+
+func rcloneTwoFactorArgs(selected remote) ([]string, error) {
+	if selected.twoFactor == nil ||
+		strings.TrimSpace(selected.twoFactor.RcloneOption) == "" {
+		return nil, nil
+	}
+	code, err := twofactor.GenerateAndWrite(*selected.twoFactor)
+	if err != nil {
+		return nil, fmt.Errorf("generate rclone TOTP: %w", err)
+	}
+	option := strings.ReplaceAll(
+		strings.TrimSpace(selected.twoFactor.RcloneOption),
+		"_",
+		"-",
+	)
+	flag := "--" + strings.ToLower(selected.backendType) + "-" + option
+	return []string{flag, code}, nil
 }
 
 func (c *Client) runCapture(ctx context.Context, args ...string) ([]byte, error) {
@@ -674,6 +853,10 @@ func buildConfig(config Config) (map[Target]remote, []byte, error) {
 				sanitizeRemoteName(account.Name),
 			)
 			target := Target{Provider: provider.Name, Account: account.Name}
+			tokenFile := ""
+			if account.OAuth != nil {
+				tokenFile = account.OAuth.TokenFile
+			}
 			remotes[target] = remote{
 				name:        remoteName,
 				backendType: provider.Type,
@@ -683,6 +866,8 @@ func buildConfig(config Config) (map[Target]remote, []byte, error) {
 				cloudName:   account.Options["cloud_name"],
 				apiKey:      account.Options["api_key"],
 				apiSecret:   account.Options["api_secret"],
+				tokenFile:   tokenFile,
+				twoFactor:   account.TwoFactor,
 			}
 
 			content.WriteString("[")
@@ -870,6 +1055,16 @@ func safeArgs(args []string) []string {
 	for index, argument := range safe {
 		if strings.HasPrefix(argument, "--password-command") {
 			safe[index] = "--password-command=***"
+		}
+		lower := strings.ToLower(argument)
+		if (strings.Contains(lower, "2fa") || strings.Contains(lower, "otp")) &&
+			strings.HasPrefix(argument, "--") {
+			if strings.Contains(argument, "=") {
+				key, _, _ := strings.Cut(argument, "=")
+				safe[index] = key + "=***"
+			} else if index+1 < len(safe) {
+				safe[index+1] = "***"
+			}
 		}
 	}
 	return safe

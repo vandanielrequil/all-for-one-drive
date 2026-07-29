@@ -88,6 +88,22 @@ func (a *Archiver) ArchiveDirectories(
 		if err != nil {
 			return summary, fmt.Errorf("resolve input directory %q: %w", inputDir, err)
 		}
+		info, err := os.Stat(absoluteDir)
+		if errors.Is(err, os.ErrNotExist) {
+			applog.Entry(
+				"archiver",
+				"ArchiveDirectories",
+				"skip missing inputDir=%s",
+				absoluteDir,
+			)
+			continue
+		}
+		if err != nil {
+			return summary, fmt.Errorf("inspect input directory %q: %w", inputDir, err)
+		}
+		if !info.IsDir() {
+			return summary, fmt.Errorf("archive input path %q is not a directory", inputDir)
+		}
 		if samePath(absoluteDir, a.config.OutputDir) || pathWithin(absoluteDir, a.config.OutputDir) {
 			return summary, fmt.Errorf("archive output directory must not be inside input directory %q", inputDir)
 		}

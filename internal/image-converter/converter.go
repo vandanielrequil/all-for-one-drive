@@ -86,6 +86,9 @@ func New(config Config) (*Converter, error) {
 // Existing output files are skipped, which makes repeated runs non-destructive.
 func (c *Converter) ProcessDir(ctx context.Context, report func(Progress)) (Summary, error) {
 	applog.Entry("image-converter", "ProcessDir", "inputDir=%s outputDir=%s", c.config.InputDir, c.config.OutputDir)
+	if err := os.MkdirAll(c.config.OutputDir, 0o755); err != nil {
+		return Summary{}, fmt.Errorf("create image output directory: %w", err)
+	}
 	files, err := c.sourceFiles()
 	if err != nil {
 		return Summary{}, err

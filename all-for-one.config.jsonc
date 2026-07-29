@@ -46,11 +46,14 @@
       //   "accounts": [
       //     {
       //       "name": "personal",
-      //       "rootPath": "all-for-one-drive",
+      //       "rootPath": "",
+      //       // OAuth выполняется один раз; refresh token сохраняется рядом.
+      //       "oauth": {
+      //         "tokenFile": "./google-drive-personal.oauth-token"
+      //       },
       //       "options": {
       //         "client_id": "CLIENT_ID",
       //         "client_secret": "CLIENT_SECRET",
-      //         "token": "{\"access_token\":\"...\",\"token_type\":\"Bearer\",\"refresh_token\":\"...\",\"expiry\":\"...\"}",
       //         "root_folder_id": ""
       //       }
       //     }
@@ -151,6 +154,11 @@
       //   "accounts": [{
       //     "name": "personal",
       //     "rootPath": "all-for-one-drive",
+      //     "twoFactor": {
+      //       "secret": "BASE32_TOTP_SECRET",
+      //       "outputFile": "./mega-personal.otp",
+      //       "rcloneOption": "2fa"
+      //     },
       //     "options": {
       //       "user": "EMAIL",
       //       "pass": "PASSWORD"

@@ -57,6 +57,20 @@ func Load(path string) (Config, error) {
 	result.VideoConverter.OutputDir = resolvePath(baseDir, result.VideoConverter.OutputDir)
 	result.Archiver.OutputDir = resolvePath(baseDir, result.Archiver.OutputDir)
 	result.Rclone.UploadDir = resolvePath(baseDir, result.Rclone.UploadDir)
+	for providerIndex := range result.Rclone.Providers {
+		for accountIndex := range result.Rclone.Providers[providerIndex].Accounts {
+			account := &result.Rclone.Providers[providerIndex].Accounts[accountIndex]
+			if account.OAuth != nil {
+				account.OAuth.TokenFile = resolvePath(baseDir, account.OAuth.TokenFile)
+			}
+			if account.TwoFactor != nil {
+				account.TwoFactor.OutputFile = resolvePath(
+					baseDir,
+					account.TwoFactor.OutputFile,
+				)
+			}
+		}
+	}
 	return result, nil
 }
 

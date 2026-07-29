@@ -26,6 +26,8 @@ go.work.sum
 
 # env file
 .env
+*.oauth-token
+*.otp
 
 # Editor/IDE
 # .idea/

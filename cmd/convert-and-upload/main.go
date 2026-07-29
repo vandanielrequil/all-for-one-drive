@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -59,18 +60,22 @@ func run() (runErr error) {
 	defer stop()
 
 	if len(globalConfig.Rclone.Providers) == 0 {
-		return fmt.Errorf("rclone cloudinary provider is not configured")
+		return fmt.Errorf("rclone provider is not configured")
 	}
 	applog.Entry("convert-and-upload", "run", "stage=rclone pre-check")
-	cloudClient, err := rcloneclient.New(globalConfig.Rclone)
+	cloudClient, err := rcloneclient.New(ctx, globalConfig.Rclone)
 	if err != nil {
 		return fmt.Errorf("initialize rclone: %w", err)
 	}
-	defer cloudClient.Close()
+	defer func() {
+		if err := cloudClient.Close(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close rclone: %w", err))
+		}
+	}()
 	checkResults := cloudClient.PreCheck(ctx)
-	cloudinaryTarget, err := cloudClient.BestTarget("cloudinary", checkResults)
+	uploadTarget, err := cloudClient.BestTarget("drive", checkResults)
 	if err != nil {
-		return fmt.Errorf("select Cloudinary account: %w", err)
+		return fmt.Errorf("select Google Drive account: %w", err)
 	}
 
 	applog.Entry("convert-and-upload", "run", "stage=image conversion")
@@ -87,7 +92,7 @@ func run() (runErr error) {
 	}
 	printConversionSummary("video-converter", videoSummary.Total, videoSummary.Converted, videoSummary.Skipped, videoSummary.Failed)
 
-	acceptsArchives, err := cloudClient.AcceptsArchives(cloudinaryTarget)
+	acceptsArchives, err := cloudClient.AcceptsArchives(uploadTarget)
 	if err != nil {
 		return err
 	}
@@ -151,16 +156,16 @@ func run() (runErr error) {
 		"convert-and-upload",
 		"run",
 		"stage=upload provider=%s account=%s destination=all-for-one",
-		cloudinaryTarget.Provider,
-		cloudinaryTarget.Account,
+		uploadTarget.Provider,
+		uploadTarget.Account,
 	)
 	if err := cloudClient.Upload(
 		ctx,
-		cloudinaryTarget,
+		uploadTarget,
 		uploadSources,
 		"all-for-one",
 	); err != nil {
-		return fmt.Errorf("upload files to Cloudinary: %w", err)
+		return fmt.Errorf("upload files: %w", err)
 	}
 	if !shouldArchive {
 		if err := clearUploadDirectory(globalConfig.Rclone.UploadDir); err != nil {
@@ -206,7 +211,13 @@ func stageConvertedFiles(uploadDir string, sourceDirs map[string]string) error {
 				return err
 			}
 			if _, err := os.Stat(destination); err == nil {
-				return fmt.Errorf("upload staging file already exists: %s", destination)
+				applog.Entry(
+					"convert-and-upload",
+					"stageConvertedFiles",
+					"skip existing destination=%s",
+					destination,
+				)
+				return nil
 			} else if !os.IsNotExist(err) {
 				return err
 			}
