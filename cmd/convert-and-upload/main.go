@@ -91,8 +91,17 @@ func run() (runErr error) {
 	if err != nil {
 		return err
 	}
+	shouldArchive := globalConfig.Archive && acceptsArchives
+	applog.Entry(
+		"convert-and-upload",
+		"run",
+		"archive=%t providerAcceptsArchives=%t shouldArchive=%t",
+		globalConfig.Archive,
+		acceptsArchives,
+		shouldArchive,
+	)
 	var uploadSources []string
-	if acceptsArchives {
+	if shouldArchive {
 		mediaArchiver, err := archiver.New(globalConfig.Archiver)
 		if err != nil {
 			return fmt.Errorf("invalid archiver config: %w", err)
@@ -153,7 +162,7 @@ func run() (runErr error) {
 	); err != nil {
 		return fmt.Errorf("upload files to Cloudinary: %w", err)
 	}
-	if !acceptsArchives {
+	if !shouldArchive {
 		if err := clearUploadDirectory(globalConfig.Rclone.UploadDir); err != nil {
 			return fmt.Errorf("clear upload staging directory: %w", err)
 		}

@@ -17,6 +17,7 @@ import (
 )
 
 type Config struct {
+	Archive        bool                  `json:"archive"`
 	ImageConverter imageconverter.Config `json:"imageConverter"`
 	VideoConverter videoconverter.Config `json:"videoConverter"`
 	Archiver       archiver.Config       `json:"archiver"`
