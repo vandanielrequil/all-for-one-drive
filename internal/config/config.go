@@ -12,6 +12,7 @@ import (
 	"all-for-one-drive/internal/applog"
 	"all-for-one-drive/internal/archiver"
 	imageconverter "all-for-one-drive/internal/image-converter"
+	rcloneclient "all-for-one-drive/internal/rclone"
 	videoconverter "all-for-one-drive/internal/video-converter"
 )
 
@@ -19,6 +20,7 @@ type Config struct {
 	ImageConverter imageconverter.Config `json:"imageConverter"`
 	VideoConverter videoconverter.Config `json:"videoConverter"`
 	Archiver       archiver.Config       `json:"archiver"`
+	Rclone         rcloneclient.Config   `json:"rclone"`
 }
 
 // Load reads a JSONC config and resolves module directory paths relative to it.
@@ -53,6 +55,7 @@ func Load(path string) (Config, error) {
 	result.VideoConverter.InputDir = resolvePath(baseDir, result.VideoConverter.InputDir)
 	result.VideoConverter.OutputDir = resolvePath(baseDir, result.VideoConverter.OutputDir)
 	result.Archiver.OutputDir = resolvePath(baseDir, result.Archiver.OutputDir)
+	result.Rclone.UploadDir = resolvePath(baseDir, result.Rclone.UploadDir)
 	return result, nil
 }
 

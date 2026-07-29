@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"all-for-one-drive/internal/archiver"
 	"all-for-one-drive/internal/config"
 	imageconverter "all-for-one-drive/internal/image-converter"
+	rcloneclient "all-for-one-drive/internal/rclone"
 	videoconverter "all-for-one-drive/internal/video-converter"
 )
 
@@ -23,11 +25,14 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (runErr error) {
 	if err := applog.Init(); err != nil {
 		return err
 	}
-	defer applog.Close()
+	defer func() {
+		applog.Error("convert-and-upload", "run", runErr)
+		applog.Close()
+	}()
 
 	applog.Entry("convert-and-upload", "run", "start")
 	defaultConfig, err := configPathNextToExecutable()
@@ -50,13 +55,23 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("invalid videoConverter config: %w", err)
 	}
-	mediaArchiver, err := archiver.New(globalConfig.Archiver)
-	if err != nil {
-		return fmt.Errorf("invalid archiver config: %w", err)
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	if len(globalConfig.Rclone.Providers) == 0 {
+		return fmt.Errorf("rclone cloudinary provider is not configured")
+	}
+	applog.Entry("convert-and-upload", "run", "stage=rclone pre-check")
+	cloudClient, err := rcloneclient.New(globalConfig.Rclone)
+	if err != nil {
+		return fmt.Errorf("initialize rclone: %w", err)
+	}
+	defer cloudClient.Close()
+	checkResults := cloudClient.PreCheck(ctx)
+	cloudinaryTarget, err := cloudClient.BestTarget("cloudinary", checkResults)
+	if err != nil {
+		return fmt.Errorf("select Cloudinary account: %w", err)
+	}
 
 	applog.Entry("convert-and-upload", "run", "stage=image conversion")
 	imageSummary, err := imageConverter.ProcessDir(ctx, printImageProgress)
@@ -72,28 +87,150 @@ func run() error {
 	}
 	printConversionSummary("video-converter", videoSummary.Total, videoSummary.Converted, videoSummary.Skipped, videoSummary.Failed)
 
-	applog.Entry("convert-and-upload", "run", "stage=archiving")
-	archiveSummary, err := mediaArchiver.ArchiveDirectories(
-		ctx,
-		[]string{
-			globalConfig.ImageConverter.OutputDir,
-			globalConfig.VideoConverter.OutputDir,
-		},
-		"",
-		printArchiveProgress,
-	)
+	acceptsArchives, err := cloudClient.AcceptsArchives(cloudinaryTarget)
 	if err != nil {
 		return err
 	}
+	var uploadSources []string
+	if acceptsArchives {
+		mediaArchiver, err := archiver.New(globalConfig.Archiver)
+		if err != nil {
+			return fmt.Errorf("invalid archiver config: %w", err)
+		}
+		applog.Entry("convert-and-upload", "run", "stage=archiving")
+		archiveSummary, err := mediaArchiver.ArchiveDirectories(
+			ctx,
+			[]string{
+				globalConfig.ImageConverter.OutputDir,
+				globalConfig.VideoConverter.OutputDir,
+			},
+			"",
+			printArchiveProgress,
+		)
+		if err != nil {
+			return err
+		}
+		applog.Entry(
+			"convert-and-upload",
+			"run",
+			"archiving done directories=%d files=%d archives=%d",
+			archiveSummary.Directories,
+			archiveSummary.Files,
+			archiveSummary.Archives,
+		)
+		uploadSources = []string{globalConfig.Archiver.OutputDir}
+	} else {
+		applog.Entry(
+			"convert-and-upload",
+			"run",
+			"stage=staging without archives uploadDir=%s",
+			globalConfig.Rclone.UploadDir,
+		)
+		if err := stageConvertedFiles(
+			globalConfig.Rclone.UploadDir,
+			map[string]string{
+				"images": globalConfig.ImageConverter.OutputDir,
+				"videos": globalConfig.VideoConverter.OutputDir,
+			},
+		); err != nil {
+			return fmt.Errorf("stage converted files: %w", err)
+		}
+		uploadSources = []string{globalConfig.Rclone.UploadDir}
+	}
+
 	applog.Entry(
 		"convert-and-upload",
 		"run",
-		"done directories=%d files=%d archives=%d",
-		archiveSummary.Directories,
-		archiveSummary.Files,
-		archiveSummary.Archives,
+		"stage=upload provider=%s account=%s destination=all-for-one",
+		cloudinaryTarget.Provider,
+		cloudinaryTarget.Account,
 	)
+	if err := cloudClient.Upload(
+		ctx,
+		cloudinaryTarget,
+		uploadSources,
+		"all-for-one",
+	); err != nil {
+		return fmt.Errorf("upload files to Cloudinary: %w", err)
+	}
+	if !acceptsArchives {
+		if err := clearUploadDirectory(globalConfig.Rclone.UploadDir); err != nil {
+			return fmt.Errorf("clear upload staging directory: %w", err)
+		}
+	}
+	applog.Entry("convert-and-upload", "run", "done")
 	return nil
+}
+
+func stageConvertedFiles(uploadDir string, sourceDirs map[string]string) error {
+	applog.Entry(
+		"convert-and-upload",
+		"stageConvertedFiles",
+		"uploadDir=%s sourceDirs=%v",
+		uploadDir,
+		sourceDirs,
+	)
+	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+		return err
+	}
+	for category, sourceDir := range sourceDirs {
+		_, err := os.Stat(sourceDir)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		err = filepath.WalkDir(sourceDir, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			relativePath, err := filepath.Rel(sourceDir, path)
+			if err != nil {
+				return err
+			}
+			destination := filepath.Join(uploadDir, category, relativePath)
+			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+				return err
+			}
+			if _, err := os.Stat(destination); err == nil {
+				return fmt.Errorf("upload staging file already exists: %s", destination)
+			} else if !os.IsNotExist(err) {
+				return err
+			}
+			applog.Entry(
+				"convert-and-upload",
+				"stageConvertedFiles",
+				"move source=%s destination=%s",
+				path,
+				destination,
+			)
+			return os.Rename(path, destination)
+		})
+		if err != nil {
+			return err
+		}
+		if err := os.RemoveAll(sourceDir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func clearUploadDirectory(uploadDir string) error {
+	applog.Entry(
+		"convert-and-upload",
+		"clearUploadDirectory",
+		"uploadDir=%s",
+		uploadDir,
+	)
+	if err := os.RemoveAll(uploadDir); err != nil {
+		return err
+	}
+	return os.MkdirAll(uploadDir, 0o755)
 }
 
 func configPathNextToExecutable() (string, error) {

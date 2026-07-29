@@ -221,8 +221,8 @@ func (a *Archiver) runSevenZip(
 
 	cmd := exec.CommandContext(ctx, a.sevenZip, args...)
 	cmd.Dir = inputDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = applog.Writer()
+	cmd.Stderr = applog.Writer()
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()

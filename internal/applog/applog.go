@@ -81,3 +81,13 @@ func Error(module, function string, err error) {
 	}
 	Entry(module, function, "error: %v", err)
 }
+
+// Writer returns the shared console and log-file writer for external tools.
+func Writer() io.Writer {
+	mu.Lock()
+	defer mu.Unlock()
+	if writer == nil {
+		return os.Stdout
+	}
+	return writer
+}

@@ -22,5 +22,153 @@
     "outputDir": "./archive-output",
     // Максимальный размер архива. Один большой файл является исключением.
     "maxArchiveSizeMB": 500
+  },
+  "rclone": {
+    // Временная папка для файлов, которые провайдер принимает без архивов.
+    "uploadDir": "./upload-output",
+    // Универсальная форма поддерживает любой backend текущей версии rclone.
+    // Точные ключи options можно получить командой:
+    // rclone config providers
+    //
+    // priority задаётся провайдеру: 1 — минимальный, 100 — максимальный.
+    // accounts — массив аккаунтов одного провайдера.
+    // rootPath — необязательная корневая папка для проверок и загрузки.
+    "providers": [
+      // OAuth: Google Drive, Dropbox, OneDrive, Box, pCloud, Yandex,
+      // Zoho, Jottacloud, Koofr, Put.io, ShareFile и другие.
+      // {
+      //   "name": "google-drive",
+      //   "type": "drive",
+      //   "priority": 100,
+      //   "acceptsArchives": true,
+      //   "accounts": [
+      //     {
+      //       "name": "personal",
+      //       "rootPath": "all-for-one-drive",
+      //       "options": {
+      //         "client_id": "CLIENT_ID",
+      //         "client_secret": "CLIENT_SECRET",
+      //         "token": "{\"access_token\":\"...\",\"token_type\":\"Bearer\",\"refresh_token\":\"...\",\"expiry\":\"...\"}",
+      //         "root_folder_id": ""
+      //       }
+      //     }
+      //   ]
+      // },
+      //
+      // S3 и S3-совместимые: AWS, Cloudflare R2, Wasabi, MinIO,
+      // DigitalOcean Spaces, Scaleway, Backblaze S3 и другие.
+      // {
+      //   "name": "s3-storage",
+      //   "type": "s3",
+      //   "priority": 90,
+      //   "acceptsArchives": true,
+      //   "accounts": [
+      //     {
+      //       "name": "primary",
+      //       "rootPath": "bucket/all-for-one-drive",
+      //       "options": {
+      //         "provider": "AWS",
+      //         "access_key_id": "ACCESS_KEY",
+      //         "secret_access_key": "SECRET_KEY",
+      //         "region": "REGION",
+      //         "endpoint": ""
+      //       }
+      //     }
+      //   ]
+      // },
+      //
+      // Backblaze B2.
+      // {
+      //   "name": "backblaze-b2",
+      //   "type": "b2",
+      //   "priority": 80,
+      //   "acceptsArchives": true,
+      //   "accounts": [{
+      //     "name": "primary",
+      //     "rootPath": "bucket/all-for-one-drive",
+      //     "options": {
+      //       "account": "APPLICATION_KEY_ID",
+      //       "key": "APPLICATION_KEY"
+      //     }
+      //   }]
+      // },
+      //
+      // Cloudinary. cloud_name, api_key и api_secret находятся в:
+      // https://console.cloudinary.com/pm/developer-dashboard
+      // Credentials указываются как есть; программа сама вызывает
+      // `rclone config create --obscure` во временном конфиге.
+      {
+        "name": "cloudinary",
+        "type": "cloudinary",
+        "priority": 85,
+        // Cloudinary принимает обработанные JPEG/MP4 напрямую, но не архивы.
+        "acceptsArchives": false,
+        "accounts": [
+          {
+            "name": "primary",
+            "options": {
+              "cloud_name": "CLOUDINARY_CLOUD_NAME",
+              "api_key": "CLOUDINARY_API_KEY",
+              "api_secret": "CLOUDINARY_API_SECRET",
+              "upload_prefix": "",
+              "upload_preset": ""
+            }
+          }
+        ]
+      }
+      //
+      // Azure Blob / Azure Files / Google Cloud Storage / Oracle Object
+      // Storage / OpenStack Swift используют ту же форму; меняются type и
+      // ключи options согласно `rclone config providers`.
+      //
+      // WebDAV: Nextcloud, ownCloud, SharePoint, Fastmail и другие.
+      // {
+      //   "name": "webdav-storage",
+      //   "type": "webdav",
+      //   "priority": 70,
+      //   "acceptsArchives": true,
+      //   "accounts": [{
+      //     "name": "primary",
+      //     "rootPath": "all-for-one-drive",
+      //     "options": {
+      //       "url": "https://cloud.example.com/remote.php/dav/files/user/",
+      //       "vendor": "nextcloud",
+      //       "user": "USER",
+      //       "pass": "PASSWORD"
+      //     }
+      //   }]
+      // },
+      //
+      // Логин/пароль: Mega, Proton Drive, OpenDrive, Mail.ru, FTP, SMB,
+      // SFTP, Seafile и другие. Имена полей отличаются у backend-ов.
+      // {
+      //   "name": "mega",
+      //   "type": "mega",
+      //   "priority": 60,
+      //   "acceptsArchives": true,
+      //   "accounts": [{
+      //     "name": "personal",
+      //     "rootPath": "all-for-one-drive",
+      //     "options": {
+      //       "user": "EMAIL",
+      //       "pass": "PASSWORD"
+      //     }
+      //   }]
+      // },
+      //
+      // Эта же универсальная форма работает со всеми backend-ами rclone:
+      // Azure Blob, Azure Files, B2, Box, Cloudinary, Doi, Drime, Drive,
+      // Dropbox, 1Fichier, FileFabric, FileLu, Filen, Files.com, FTP,
+      // Gofile, Google Cloud Storage, Google Photos, HDFS, HiDrive, HTTP,
+      // Huawei Drive, iCloud Drive, ImageKit, Internet Archive, Internxt,
+      // Jottacloud, Koofr, Linkbox, Mail.ru, Mega, NetStorage, OneDrive,
+      // OpenDrive, Oracle Object Storage, pCloud, PikPak, PixelDrain,
+      // Premiumize.me, Proton Drive, Put.io, QingStor, Quatrix, S3,
+      // Seafile, SFTP, Shade, ShareFile, Sia, SMB, Storj, SugarSync,
+      // Swift, Uloz.to, WebDAV, Yandex и Zoho.
+      //
+      // Password-поля можно задавать открытым текстом: при создании временного
+      // rclone-конфига программа передаёт флаг `--obscure`.
+    ]
   }
 }

@@ -1,9 +1,11 @@
 package videoconverter
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -246,8 +248,8 @@ func (c *Converter) runFFmpeg(ctx context.Context, sourcePath, outputPath string
 	fmt.Fprintf(os.Stderr, "ffmpeg: %s -> %s\n", sourcePath, outputPath)
 
 	cmd := exec.CommandContext(ctx, c.ffmpeg, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = applog.Writer()
+	cmd.Stderr = applog.Writer()
 	if err := cmd.Run(); err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return ctx.Err()
@@ -266,10 +268,15 @@ func (c *Converter) probeVideoSize(ctx context.Context, sourcePath string) (int,
 		"-of", "csv=p=0:s=x",
 		sourcePath,
 	)
-	output, err := cmd.Output()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = io.MultiWriter(&stdout, applog.Writer())
+	cmd.Stderr = io.MultiWriter(&stderr, applog.Writer())
+	err := cmd.Run()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
 	}
+	output := stdout.Bytes()
 	parts := strings.Split(strings.TrimSpace(string(output)), "x")
 	if len(parts) != 2 {
 		return 0, 0, fmt.Errorf("unexpected ffprobe output: %q", output)
