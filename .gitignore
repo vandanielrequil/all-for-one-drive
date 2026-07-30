@@ -28,6 +28,7 @@ go.work.sum
 .env
 *.oauth-token
 *.otp
+availability.log
 
 # Editor/IDE
 # .idea/

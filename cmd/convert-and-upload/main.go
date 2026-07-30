@@ -238,18 +238,39 @@ func buildEchelonPlans(
 		lastEchelon = 3
 	}
 	plans := make([]echelonPlan, 0, lastEchelon-startEchelon+1)
+	var missing []int
 	for echelon := startEchelon; echelon <= lastEchelon; echelon++ {
 		targets := client.TargetsForEchelon(echelon, results)
 		if len(targets) == 0 {
-			return nil, fmt.Errorf(
-				"echelon %d has no available storage with priority 1..100",
+			missing = append(missing, echelon)
+			applog.Entry(
+				"convert-and-upload",
+				"buildEchelonPlans",
+				"echelon=%d skipped: no available storage with priority 1..100",
 				echelon,
 			)
+			continue
 		}
 		plans = append(plans, echelonPlan{
 			echelon: echelon,
 			targets: targets,
 		})
+	}
+	if len(plans) == 0 {
+		return nil, fmt.Errorf(
+			"no available storage in echelons %d..%d",
+			startEchelon,
+			lastEchelon,
+		)
+	}
+	if len(missing) > 0 {
+		applog.Entry(
+			"convert-and-upload",
+			"buildEchelonPlans",
+			"replication incomplete: missing echelons=%v available=%d",
+			missing,
+			len(plans),
+		)
 	}
 	return plans, nil
 }

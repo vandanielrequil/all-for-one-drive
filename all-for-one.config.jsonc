@@ -83,12 +83,13 @@
       // {
       //   "name": "backblaze-b2",
       //   "type": "b2",
-      //   "echelon": 2,
-      //   "priority": 80,
+      //   "echelon": 1,
+      //   "priority": 4,
       //   "acceptsArchives": true,
+      //   "maxUsageMB": 9900,
       //   "accounts": [{
-      //     "name": "primary",
-      //     "rootPath": "bucket/all-for-one-drive",
+      //     "name": "all-for-one-key",
+      //     "rootPath": "all-for-one", // bucket name
       //     "options": {
       //       "account": "APPLICATION_KEY_ID",
       //       "key": "APPLICATION_KEY"

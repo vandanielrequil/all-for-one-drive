@@ -1264,9 +1264,17 @@ func logCheckTable(results []CheckResult) {
 		}
 		switch result.Priority {
 		case 0:
-			status = "ОТКЛЮЧЕН"
+			if result.LoginOK {
+				status = "ОТКЛЮЧЕН"
+			} else {
+				status = "ОТКЛЮЧЕН+ОШИБКА"
+			}
 		case 101:
-			status = "ЗАПОЛНЕН"
+			if result.LoginOK {
+				status = "ЗАПОЛНЕН"
+			} else {
+				status = "ЗАПОЛНЕН+ОШИБКА"
+			}
 		}
 		free := "не поддерживается"
 		if result.FreeBytes != nil {
