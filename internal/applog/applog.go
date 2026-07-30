@@ -11,9 +11,10 @@ import (
 )
 
 var (
-	mu     sync.Mutex
-	writer io.Writer
-	file   *os.File
+	mu        sync.Mutex
+	writer    io.Writer
+	file      *os.File
+	errorPath string
 )
 
 func Init() error {
@@ -27,7 +28,12 @@ func Init() error {
 	}
 
 	baseName := strings.TrimSuffix(filepath.Base(executable), filepath.Ext(executable))
-	logPath := filepath.Join(filepath.Dir(executable), baseName+".log")
+	executableDir := filepath.Dir(executable)
+	logPath := filepath.Join(executableDir, baseName+".log")
+	errorPath = filepath.Join(executableDir, baseName+".error")
+	if err := os.Remove(errorPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove previous error marker %q: %w", errorPath, err)
+	}
 
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -39,7 +45,7 @@ func Init() error {
 	writer = io.MultiWriter(os.Stdout, logFile)
 	mu.Unlock()
 
-	Entry("applog", "Init", "logPath=%s", logPath)
+	Entry("applog", "Init", "logPath=%s errorPath=%s", logPath, errorPath)
 	return nil
 }
 
@@ -80,6 +86,30 @@ func Error(module, function string, err error) {
 		return
 	}
 	Entry(module, function, "error: %v", err)
+}
+
+// WriteErrorMarker creates {binary}.error with the failure text.
+// On success the marker must not exist; Init removes a leftover marker.
+func WriteErrorMarker(err error) error {
+	if err == nil {
+		return nil
+	}
+	mu.Lock()
+	path := errorPath
+	mu.Unlock()
+	if path == "" {
+		executable, resolveErr := os.Executable()
+		if resolveErr != nil {
+			return resolveErr
+		}
+		executable, resolveErr = filepath.EvalSymlinks(executable)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		baseName := strings.TrimSuffix(filepath.Base(executable), filepath.Ext(executable))
+		path = filepath.Join(filepath.Dir(executable), baseName+".error")
+	}
+	return os.WriteFile(path, []byte(err.Error()+"\n"), 0o644)
 }
 
 // Writer returns the shared console and log-file writer for external tools.

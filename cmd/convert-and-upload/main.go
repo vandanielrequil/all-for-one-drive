@@ -21,6 +21,7 @@ import (
 func main() {
 	if err := run(); err != nil {
 		applog.Error("convert-and-upload", "main", err)
+		_ = applog.WriteErrorMarker(err)
 		fmt.Fprintf(os.Stderr, "convert-and-upload: %v\n", err)
 		os.Exit(1)
 	}
@@ -28,10 +29,14 @@ func main() {
 
 func run() (runErr error) {
 	if err := applog.Init(); err != nil {
+		_ = applog.WriteErrorMarker(err)
 		return err
 	}
 	defer func() {
 		applog.Error("convert-and-upload", "run", runErr)
+		if runErr != nil {
+			_ = applog.WriteErrorMarker(runErr)
+		}
 		applog.Close()
 	}()
 
@@ -84,6 +89,9 @@ func run() (runErr error) {
 		return err
 	}
 	printConversionSummary("image-converter", imageSummary.Total, imageSummary.Converted, imageSummary.Skipped, imageSummary.Failed)
+	if imageSummary.Failed > 0 {
+		return fmt.Errorf("image conversion failed for %d file(s)", imageSummary.Failed)
+	}
 
 	applog.Entry("convert-and-upload", "run", "stage=video conversion")
 	videoSummary, err := videoConverter.ProcessDir(ctx, printVideoProgress)
@@ -91,6 +99,9 @@ func run() (runErr error) {
 		return err
 	}
 	printConversionSummary("video-converter", videoSummary.Total, videoSummary.Converted, videoSummary.Skipped, videoSummary.Failed)
+	if videoSummary.Failed > 0 {
+		return fmt.Errorf("video conversion failed for %d file(s)", videoSummary.Failed)
+	}
 
 	acceptsArchives, err := cloudClient.AcceptsArchives(uploadTarget)
 	if err != nil {
@@ -142,9 +153,9 @@ func run() (runErr error) {
 		)
 		if err := stageConvertedFiles(
 			globalConfig.Rclone.UploadDir,
-			map[string]string{
-				"images": globalConfig.ImageConverter.OutputDir,
-				"videos": globalConfig.VideoConverter.OutputDir,
+			[]string{
+				globalConfig.ImageConverter.OutputDir,
+				globalConfig.VideoConverter.OutputDir,
 			},
 		); err != nil {
 			return fmt.Errorf("stage converted files: %w", err)
@@ -180,7 +191,7 @@ func run() (runErr error) {
 	return nil
 }
 
-func stageConvertedFiles(uploadDir string, sourceDirs map[string]string) error {
+func stageConvertedFiles(uploadDir string, sourceDirs []string) error {
 	applog.Entry(
 		"convert-and-upload",
 		"stageConvertedFiles",
@@ -191,7 +202,7 @@ func stageConvertedFiles(uploadDir string, sourceDirs map[string]string) error {
 	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
 		return err
 	}
-	for category, sourceDir := range sourceDirs {
+	for _, sourceDir := range sourceDirs {
 		_, err := os.Stat(sourceDir)
 		if os.IsNotExist(err) {
 			continue
@@ -210,7 +221,7 @@ func stageConvertedFiles(uploadDir string, sourceDirs map[string]string) error {
 			if err != nil {
 				return err
 			}
-			destination := filepath.Join(uploadDir, category, relativePath)
+			destination := filepath.Join(uploadDir, relativePath)
 			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 				return err
 			}

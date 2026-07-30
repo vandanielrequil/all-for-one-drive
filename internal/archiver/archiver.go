@@ -66,15 +66,25 @@ func New(config Config) (*Archiver, error) {
 	return &Archiver{config: config, sevenZip: sevenZip}, nil
 }
 
-// ArchiveDirectories archives each directory independently. Files from
-// different directories are never placed in the same archive.
+// ArchiveDirectories archives each input root independently. Files that share
+// the same relative parent directory are archived together and written under
+// archive-output/<relativeParent>/ so upload mirrors user-created folders.
+// Matching relative paths from different roots (e.g. image-output/trip and
+// video-output/trip) land in the same archive-output/trip folder. Files from
+// different directories are never mixed in one archive.
 func (a *Archiver) ArchiveDirectories(
 	ctx context.Context,
 	inputDirs []string,
 	password string,
 	report func(Progress),
 ) (Summary, error) {
-	applog.Entry("archiver", "ArchiveDirectories", "inputDirs=%v passwordSet=%t", inputDirs, password != "")
+	applog.Entry(
+		"archiver",
+		"ArchiveDirectories",
+		"inputDirs=%v passwordSet=%t",
+		inputDirs,
+		password != "",
+	)
 	if err := os.MkdirAll(a.config.OutputDir, 0o755); err != nil {
 		return Summary{}, fmt.Errorf("create archive output directory: %w", err)
 	}
@@ -105,7 +115,10 @@ func (a *Archiver) ArchiveDirectories(
 			return summary, fmt.Errorf("archive input path %q is not a directory", inputDir)
 		}
 		if samePath(absoluteDir, a.config.OutputDir) || pathWithin(absoluteDir, a.config.OutputDir) {
-			return summary, fmt.Errorf("archive output directory must not be inside input directory %q", inputDir)
+			return summary, fmt.Errorf(
+				"archive output directory must not be inside input directory %q",
+				inputDir,
+			)
 		}
 
 		files, err := collectFiles(absoluteDir)
@@ -113,27 +126,69 @@ func (a *Archiver) ArchiveDirectories(
 			return summary, err
 		}
 		if len(files) == 0 {
-			fmt.Printf("Архиватор: %s пустая, пропуск\n", absoluteDir)
+			applog.Entry(
+				"archiver",
+				"ArchiveDirectories",
+				"skip empty inputDir=%s",
+				absoluteDir,
+			)
 			continue
 		}
 
-		groups := groupFiles(files, a.config.MaxArchiveSizeMB*bytesPerMegabyte)
+		parentGroups := groupFilesByParent(files)
 		directoryArchives := 0
-		for _, group := range groups {
-			created, err := a.archiveGroup(ctx, absoluteDir, group, password, report)
-			if err != nil {
-				return summary, err
+		for _, parentRelative := range parentGroupKeys(parentGroups) {
+			groupFilesList := parentGroups[parentRelative]
+			sourceDir := absoluteDir
+			if parentRelative != "." {
+				sourceDir = filepath.Join(absoluteDir, parentRelative)
 			}
-			directoryArchives += created
+			archiveOutputDir := a.config.OutputDir
+			if parentRelative != "." {
+				archiveOutputDir = filepath.Join(a.config.OutputDir, parentRelative)
+			}
+			if err := os.MkdirAll(archiveOutputDir, 0o755); err != nil {
+				return summary, fmt.Errorf("create archive directory %q: %w", archiveOutputDir, err)
+			}
+
+			localFiles := make([]sourceFile, len(groupFilesList))
+			for index, file := range groupFilesList {
+				localFiles[index] = sourceFile{
+					relativePath: filepath.Base(file.relativePath),
+					size:         file.size,
+				}
+			}
+			sizeGroups := groupFiles(localFiles, a.config.MaxArchiveSizeMB*bytesPerMegabyte)
+			for _, sizeGroup := range sizeGroups {
+				created, err := a.archiveGroup(
+					ctx,
+					sourceDir,
+					archiveOutputDir,
+					sizeGroup,
+					password,
+					report,
+				)
+				if err != nil {
+					return summary, err
+				}
+				directoryArchives += created
+			}
+			summary.Directories++
 		}
 
 		if err := clearDirectory(absoluteDir); err != nil {
 			return summary, fmt.Errorf("clear archived directory %q: %w", absoluteDir, err)
 		}
-		summary.Directories++
 		summary.Archives += directoryArchives
 		summary.Files += len(files)
-		fmt.Printf("Архиватор: %s очищена после успешной архивации\n", absoluteDir)
+		applog.Entry(
+			"archiver",
+			"ArchiveDirectories",
+			"cleared inputDir=%s archives=%d files=%d",
+			absoluteDir,
+			directoryArchives,
+			len(files),
+		)
 	}
 	return summary, nil
 }
@@ -141,12 +196,21 @@ func (a *Archiver) ArchiveDirectories(
 func (a *Archiver) archiveGroup(
 	ctx context.Context,
 	inputDir string,
+	archiveOutputDir string,
 	files []sourceFile,
 	password string,
 	report func(Progress),
 ) (int, error) {
-	applog.Entry("archiver", "archiveGroup", "inputDir=%s files=%d passwordSet=%t", inputDir, len(files), password != "")
-	archivePath, err := a.nextArchivePath(inputDir, files[0])
+	applog.Entry(
+		"archiver",
+		"archiveGroup",
+		"inputDir=%s archiveOutputDir=%s files=%d passwordSet=%t",
+		inputDir,
+		archiveOutputDir,
+		len(files),
+		password != "",
+	)
+	archivePath, err := a.nextArchivePath(archiveOutputDir, inputDir, files[0])
 	if err != nil {
 		return 0, err
 	}
@@ -164,11 +228,25 @@ func (a *Archiver) archiveGroup(
 			return 0, fmt.Errorf("remove oversized archive %q: %w", archivePath, err)
 		}
 		middle := len(files) / 2
-		leftCount, err := a.archiveGroup(ctx, inputDir, files[:middle], password, report)
+		leftCount, err := a.archiveGroup(
+			ctx,
+			inputDir,
+			archiveOutputDir,
+			files[:middle],
+			password,
+			report,
+		)
 		if err != nil {
 			return 0, err
 		}
-		rightCount, err := a.archiveGroup(ctx, inputDir, files[middle:], password, report)
+		rightCount, err := a.archiveGroup(
+			ctx,
+			inputDir,
+			archiveOutputDir,
+			files[middle:],
+			password,
+			report,
+		)
 		if err != nil {
 			return 0, err
 		}
@@ -203,7 +281,16 @@ func (a *Archiver) runSevenZip(
 	files []sourceFile,
 	password string,
 ) error {
-	applog.Entry("archiver", "runSevenZip", "inputDir=%s archivePath=%s files=%d passwordSet=%t sevenZip=%s", inputDir, archivePath, len(files), password != "", a.sevenZip)
+	applog.Entry(
+		"archiver",
+		"runSevenZip",
+		"inputDir=%s archivePath=%s files=%d passwordSet=%t sevenZip=%s",
+		inputDir,
+		archivePath,
+		len(files),
+		password != "",
+		a.sevenZip,
+	)
 	listFile, err := os.CreateTemp("", "all-for-one-7zip-*.txt")
 	if err != nil {
 		return fmt.Errorf("create 7-Zip file list: %w", err)
@@ -221,7 +308,6 @@ func (a *Archiver) runSevenZip(
 		return fmt.Errorf("close 7-Zip file list: %w", err)
 	}
 
-	fmt.Printf("7-Zip: %d файлов -> %s\n", len(files), archivePath)
 	args := []string{
 		"a",
 		"-t7z",
@@ -248,19 +334,32 @@ func (a *Archiver) runSevenZip(
 	return nil
 }
 
-func (a *Archiver) nextArchivePath(inputDir string, first sourceFile) (string, error) {
-	applog.Entry("archiver", "nextArchivePath", "inputDir=%s firstFile=%s", inputDir, first.relativePath)
+func (a *Archiver) nextArchivePath(
+	archiveOutputDir string,
+	inputDir string,
+	first sourceFile,
+) (string, error) {
+	applog.Entry(
+		"archiver",
+		"nextArchivePath",
+		"archiveOutputDir=%s inputDir=%s firstFile=%s",
+		archiveOutputDir,
+		inputDir,
+		first.relativePath,
+	)
 	directoryName := sanitizeName(filepath.Base(filepath.Clean(inputDir)))
-	fileName := sanitizeName(strings.TrimSuffix(filepath.Base(first.relativePath), filepath.Ext(first.relativePath)))
+	fileName := sanitizeName(
+		strings.TrimSuffix(filepath.Base(first.relativePath), filepath.Ext(first.relativePath)),
+	)
 	base := directoryName + "-" + fileName
-	path := filepath.Join(a.config.OutputDir, base+".7z")
+	path := filepath.Join(archiveOutputDir, base+".7z")
 	for suffix := 2; ; suffix++ {
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 			return path, nil
 		} else if err != nil {
 			return "", fmt.Errorf("inspect archive path %q: %w", path, err)
 		}
-		path = filepath.Join(a.config.OutputDir, fmt.Sprintf("%s-%d.7z", base, suffix))
+		path = filepath.Join(archiveOutputDir, fmt.Sprintf("%s-%d.7z", base, suffix))
 	}
 }
 
@@ -306,6 +405,25 @@ func collectFiles(inputDir string) ([]sourceFile, error) {
 		return files[i].relativePath < files[j].relativePath
 	})
 	return files, nil
+}
+
+func groupFilesByParent(files []sourceFile) map[string][]sourceFile {
+	applog.Entry("archiver", "groupFilesByParent", "files=%d", len(files))
+	groups := make(map[string][]sourceFile)
+	for _, file := range files {
+		parent := filepath.Dir(file.relativePath)
+		groups[parent] = append(groups[parent], file)
+	}
+	return groups
+}
+
+func parentGroupKeys(groups map[string][]sourceFile) []string {
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func groupFiles(files []sourceFile, maxSize int64) [][]sourceFile {
