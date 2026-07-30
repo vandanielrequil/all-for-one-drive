@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/signal"
@@ -17,6 +18,11 @@ import (
 	rcloneclient "all-for-one-drive/internal/rclone"
 	videoconverter "all-for-one-drive/internal/video-converter"
 )
+
+type echelonPlan struct {
+	echelon int
+	targets []rcloneclient.Target
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -78,10 +84,6 @@ func run() (runErr error) {
 		}
 	}()
 	checkResults := cloudClient.PreCheck(ctx)
-	uploadTarget, err := cloudClient.BestTarget("drive", checkResults)
-	if err != nil {
-		return fmt.Errorf("select Google Drive account: %w", err)
-	}
 
 	applog.Entry("convert-and-upload", "run", "stage=image conversion")
 	imageSummary, err := imageConverter.ProcessDir(ctx, printImageProgress)
@@ -103,21 +105,71 @@ func run() (runErr error) {
 		return fmt.Errorf("video conversion failed for %d file(s)", videoSummary.Failed)
 	}
 
-	acceptsArchives, err := cloudClient.AcceptsArchives(uploadTarget)
+	convertedFiles, err := cloudClient.CollectUploadItems([]string{
+		globalConfig.ImageConverter.OutputDir,
+		globalConfig.VideoConverter.OutputDir,
+	})
+	if err != nil {
+		return fmt.Errorf("scan converted outputs: %w", err)
+	}
+	if len(convertedFiles) == 0 {
+		applog.Entry(
+			"convert-and-upload",
+			"run",
+			"no files to upload; PreCheck completed and availability.log updated",
+		)
+		applog.Entry("convert-and-upload", "run", "done")
+		return nil
+	}
+
+	plans, err := buildEchelonPlans(
+		cloudClient,
+		checkResults,
+		globalConfig.Replication,
+		globalConfig.Echelon,
+	)
 	if err != nil {
 		return err
 	}
-	shouldArchive := globalConfig.Archive && acceptsArchives
+
+	needArchives, needDirect, err := requiredRepresentations(
+		cloudClient,
+		plans,
+		globalConfig.Archive,
+	)
+	if err != nil {
+		return err
+	}
 	applog.Entry(
 		"convert-and-upload",
 		"run",
-		"archive=%t providerAcceptsArchives=%t shouldArchive=%t",
+		"archive=%t needArchives=%t needDirect=%t replication=%d echelon=%d",
 		globalConfig.Archive,
-		acceptsArchives,
-		shouldArchive,
+		needArchives,
+		needDirect,
+		globalConfig.Replication,
+		globalConfig.Echelon,
 	)
-	var uploadSources []string
-	if shouldArchive {
+	directSources := []string{globalConfig.Rclone.UploadDir}
+	archiveSources := []string{globalConfig.Archiver.OutputDir}
+	if needDirect {
+		applog.Entry(
+			"convert-and-upload",
+			"run",
+			"stage=staging direct files uploadDir=%s",
+			globalConfig.Rclone.UploadDir,
+		)
+		if err := stageConvertedFiles(
+			globalConfig.Rclone.UploadDir,
+			[]string{
+				globalConfig.ImageConverter.OutputDir,
+				globalConfig.VideoConverter.OutputDir,
+			},
+		); err != nil {
+			return fmt.Errorf("stage converted files: %w", err)
+		}
+	}
+	if needArchives {
 		mediaArchiver, err := archiver.New(globalConfig.Archiver)
 		if err != nil {
 			return fmt.Errorf("invalid archiver config: %w", err)
@@ -143,52 +195,236 @@ func run() (runErr error) {
 			archiveSummary.Files,
 			archiveSummary.Archives,
 		)
-		uploadSources = []string{globalConfig.Archiver.OutputDir}
-	} else {
-		applog.Entry(
-			"convert-and-upload",
-			"run",
-			"stage=staging without archives uploadDir=%s",
-			globalConfig.Rclone.UploadDir,
-		)
-		if err := stageConvertedFiles(
-			globalConfig.Rclone.UploadDir,
-			[]string{
-				globalConfig.ImageConverter.OutputDir,
-				globalConfig.VideoConverter.OutputDir,
-			},
-		); err != nil {
-			return fmt.Errorf("stage converted files: %w", err)
-		}
-		uploadSources = []string{globalConfig.Rclone.UploadDir}
 	}
 
-	applog.Entry(
-		"convert-and-upload",
-		"run",
-		"stage=upload provider=%s account=%s destination=all-for-one",
-		uploadTarget.Provider,
-		uploadTarget.Account,
-	)
-	if err := cloudClient.Upload(
+	if err := uploadReplicas(
 		ctx,
-		uploadTarget,
-		uploadSources,
-		"all-for-one",
+		cloudClient,
+		plans,
+		globalConfig.Archive,
+		archiveSources,
+		directSources,
 	); err != nil {
-		return fmt.Errorf("upload files: %w", err)
+		return err
 	}
-	if shouldArchive {
+	if needArchives {
 		if err := clearDirectory(globalConfig.Archiver.OutputDir); err != nil {
 			return fmt.Errorf("clear archive output directory: %w", err)
 		}
-	} else {
+	}
+	if needDirect {
 		if err := clearDirectory(globalConfig.Rclone.UploadDir); err != nil {
 			return fmt.Errorf("clear upload staging directory: %w", err)
 		}
 	}
+	if err := clearDirectory(globalConfig.ImageConverter.OutputDir); err != nil {
+		return fmt.Errorf("clear image output directory: %w", err)
+	}
+	if err := clearDirectory(globalConfig.VideoConverter.OutputDir); err != nil {
+		return fmt.Errorf("clear video output directory: %w", err)
+	}
 	applog.Entry("convert-and-upload", "run", "done")
 	return nil
+}
+
+func buildEchelonPlans(
+	client *rcloneclient.Client,
+	results []rcloneclient.CheckResult,
+	replication int,
+	startEchelon int,
+) ([]echelonPlan, error) {
+	lastEchelon := startEchelon + replication - 1
+	if lastEchelon > 3 {
+		lastEchelon = 3
+	}
+	plans := make([]echelonPlan, 0, lastEchelon-startEchelon+1)
+	for echelon := startEchelon; echelon <= lastEchelon; echelon++ {
+		targets := client.TargetsForEchelon(echelon, results)
+		if len(targets) == 0 {
+			return nil, fmt.Errorf(
+				"echelon %d has no available storage with priority 1..100",
+				echelon,
+			)
+		}
+		plans = append(plans, echelonPlan{
+			echelon: echelon,
+			targets: targets,
+		})
+	}
+	return plans, nil
+}
+
+func requiredRepresentations(
+	client *rcloneclient.Client,
+	plans []echelonPlan,
+	archiveEnabled bool,
+) (needArchives bool, needDirect bool, err error) {
+	if !archiveEnabled {
+		return false, true, nil
+	}
+	for _, plan := range plans {
+		for _, target := range plan.targets {
+			accepts, targetErr := client.AcceptsArchives(target)
+			if targetErr != nil {
+				return false, false, targetErr
+			}
+			if accepts {
+				needArchives = true
+			} else {
+				needDirect = true
+			}
+		}
+	}
+	return needArchives, needDirect, nil
+}
+
+func uploadReplicas(
+	ctx context.Context,
+	client *rcloneclient.Client,
+	plans []echelonPlan,
+	archiveEnabled bool,
+	archiveSources []string,
+	directSources []string,
+) error {
+	for _, plan := range plans {
+		firstAcceptsArchives, err := client.AcceptsArchives(plan.targets[0])
+		if err != nil {
+			return err
+		}
+		useArchives := archiveEnabled && firstAcceptsArchives
+		sources := directSources
+		representation := "direct"
+		if useArchives {
+			sources = archiveSources
+			representation = "archives"
+		}
+		remaining, err := client.CollectUploadItems(sources)
+		if err != nil {
+			return fmt.Errorf("collect %s for echelon %d: %w", representation, plan.echelon, err)
+		}
+		if len(remaining) == 0 {
+			applog.Entry(
+				"convert-and-upload",
+				"uploadReplicas",
+				"echelon=%d representation=%s nothing to upload",
+				plan.echelon,
+				representation,
+			)
+			continue
+		}
+		var attemptErrors error
+		for _, target := range plan.targets {
+			acceptsArchives, err := client.AcceptsArchives(target)
+			if err != nil {
+				attemptErrors = errors.Join(attemptErrors, err)
+				continue
+			}
+			if archiveEnabled && acceptsArchives != useArchives {
+				applog.Entry(
+					"convert-and-upload",
+					"uploadReplicas",
+					"echelon=%d provider=%s skipped incompatible archive capability",
+					plan.echelon,
+					target.Provider,
+				)
+				continue
+			}
+			available, err := client.AvailableBytes(target)
+			if err != nil {
+				attemptErrors = errors.Join(attemptErrors, err)
+				continue
+			}
+			selected, deferred := fitUploadItems(remaining, available)
+			if len(selected) == 0 && len(remaining) > 0 {
+				applog.Entry(
+					"convert-and-upload",
+					"uploadReplicas",
+					"echelon=%d provider=%s account=%s no files fit",
+					plan.echelon,
+					target.Provider,
+					target.Account,
+				)
+				attemptErrors = errors.Join(
+					attemptErrors,
+					fmt.Errorf("%s/%s: no remaining file fits", target.Provider, target.Account),
+				)
+				continue
+			}
+			applog.Entry(
+				"convert-and-upload",
+				"uploadReplicas",
+				"echelon=%d provider=%s account=%s representation=%s files=%d remaining=%d",
+				plan.echelon,
+				target.Provider,
+				target.Account,
+				representation,
+				len(selected),
+				len(deferred),
+			)
+			uploadedCount, err := client.UploadItems(
+				ctx,
+				target,
+				selected,
+				"all-for-one",
+			)
+			if err != nil {
+				remaining = append(
+					append(
+						[]rcloneclient.UploadItem(nil),
+						selected[uploadedCount:]...,
+					),
+					deferred...,
+				)
+				applog.Entry(
+					"convert-and-upload",
+					"uploadReplicas",
+					"echelon=%d provider=%s account=%s uploaded=%d failed=%v",
+					plan.echelon,
+					target.Provider,
+					target.Account,
+					uploadedCount,
+					err,
+				)
+				attemptErrors = errors.Join(
+					attemptErrors,
+					fmt.Errorf("%s/%s: %w", target.Provider, target.Account, err),
+				)
+				continue
+			}
+			remaining = deferred
+			if len(remaining) == 0 {
+				break
+			}
+		}
+		if len(remaining) > 0 {
+			return fmt.Errorf(
+				"upload replica to echelon %d incomplete (%d files remain): %w",
+				plan.echelon,
+				len(remaining),
+				attemptErrors,
+			)
+		}
+	}
+	return nil
+}
+
+func fitUploadItems(
+	items []rcloneclient.UploadItem,
+	available *int64,
+) (selected []rcloneclient.UploadItem, deferred []rcloneclient.UploadItem) {
+	if available == nil {
+		return append([]rcloneclient.UploadItem(nil), items...), nil
+	}
+	remainingBytes := *available
+	for _, item := range items {
+		if item.Size <= remainingBytes {
+			selected = append(selected, item)
+			remainingBytes -= item.Size
+		} else {
+			deferred = append(deferred, item)
+		}
+	}
+	return selected, deferred
 }
 
 func stageConvertedFiles(uploadDir string, sourceDirs []string) error {
@@ -239,18 +475,42 @@ func stageConvertedFiles(uploadDir string, sourceDirs []string) error {
 			applog.Entry(
 				"convert-and-upload",
 				"stageConvertedFiles",
-				"move source=%s destination=%s",
+				"copy source=%s destination=%s",
 				path,
 				destination,
 			)
-			return os.Rename(path, destination)
+			return copyFile(path, destination)
 		})
 		if err != nil {
 			return err
 		}
-		if err := os.RemoveAll(sourceDir); err != nil {
-			return err
-		}
+	}
+	return nil
+}
+
+func copyFile(source, destination string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	info, err := input.Stat()
+	if err != nil {
+		return err
+	}
+	output, err := os.OpenFile(
+		destination,
+		os.O_CREATE|os.O_EXCL|os.O_WRONLY,
+		info.Mode().Perm(),
+	)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(output, input)
+	closeErr := output.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(destination)
+		return errors.Join(copyErr, closeErr)
 	}
 	return nil
 }

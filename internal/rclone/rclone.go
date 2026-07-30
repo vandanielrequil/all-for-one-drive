@@ -32,7 +32,9 @@ type Provider struct {
 	Name            string    `json:"name"`
 	Type            string    `json:"type"`
 	Priority        int       `json:"priority"`
+	Echelon         int       `json:"echelon"`
 	AcceptsArchives bool      `json:"acceptsArchives"`
+	MaxUsageMB      int64     `json:"maxUsageMB"` // 0 = без лимита; жёсткий потолок по rclone size
 	Accounts        []Account `json:"accounts"`
 }
 
@@ -58,8 +60,11 @@ type CheckResult struct {
 	Account     string
 	BackendType string
 	Priority    int
+	Echelon     int
 	LoginOK     bool
 	FreeBytes   *int64
+	UsedBytes   *int64
+	MaxUsageMB  int64
 	Usage       string
 	Error       string
 }
@@ -71,25 +76,36 @@ type Client struct {
 }
 
 type remote struct {
-	name        string
-	backendType string
-	rootPath    string
-	priority    int
-	archives    bool
-	cloudName   string
-	apiKey      string
-	apiSecret   string
-	tokenFile   string
-	twoFactor   *twofactor.Config
+	name           string
+	backendType    string
+	rootPath       string
+	priority       int
+	echelon        int
+	archives       bool
+	maxUsageBytes  int64
+	availableBytes *int64
+	cloudName      string
+	apiKey         string
+	apiSecret      string
+	tokenFile      string
+	twoFactor      *twofactor.Config
 }
 
-type uploadFile struct {
-	localPath    string
-	relativePath string
+type UploadItem struct {
+	LocalPath    string
+	RelativePath string
+	Size         int64
 }
 
 type quota struct {
-	Free *int64 `json:"free"`
+	Free  *int64 `json:"free"`
+	Used  *int64 `json:"used"`
+	Total *int64 `json:"total"`
+}
+
+type remoteSize struct {
+	Count int64 `json:"count"`
+	Bytes int64 `json:"bytes"`
 }
 
 type cloudinaryUsage struct {
@@ -359,8 +375,11 @@ func (c *Client) PreCheck(ctx context.Context) []CheckResult {
 	}
 	sort.Slice(targets, func(i, j int) bool {
 		left, right := c.remotes[targets[i]], c.remotes[targets[j]]
+		if left.echelon != right.echelon {
+			return left.echelon < right.echelon
+		}
 		if left.priority != right.priority {
-			return left.priority > right.priority
+			return left.priority < right.priority
 		}
 		if targets[i].Provider != targets[j].Provider {
 			return targets[i].Provider < targets[j].Provider
@@ -376,17 +395,40 @@ func (c *Client) PreCheck(ctx context.Context) []CheckResult {
 				Account:     target.Account,
 				BackendType: c.remotes[target].backendType,
 				Priority:    c.remotes[target].priority,
+				Echelon:     c.remotes[target].echelon,
 				Error:       ctx.Err().Error(),
 			})
 			continue
 		}
-		results = append(results, c.checkRemote(ctx, target))
+		result := c.checkRemote(ctx, target)
+		selected := c.remotes[target]
+		selected.availableBytes = effectiveAvailableBytes(result, selected.maxUsageBytes)
+		c.remotes[target] = selected
+		results = append(results, result)
 	}
 	logCheckTable(results)
 	return results
 }
 
-// BestTarget returns the available account with the highest provider priority.
+func effectiveAvailableBytes(result CheckResult, maxUsageBytes int64) *int64 {
+	var available *int64
+	if result.FreeBytes != nil {
+		value := *result.FreeBytes
+		available = &value
+	}
+	if maxUsageBytes > 0 && result.UsedBytes != nil {
+		limitAvailable := maxUsageBytes - *result.UsedBytes
+		if limitAvailable < 0 {
+			limitAvailable = 0
+		}
+		if available == nil || limitAvailable < *available {
+			available = &limitAvailable
+		}
+	}
+	return available
+}
+
+// BestTarget returns the available account with the lowest numeric priority.
 func (c *Client) BestTarget(backendType string, results []CheckResult) (Target, error) {
 	applog.Entry(
 		"rclone",
@@ -398,10 +440,13 @@ func (c *Client) BestTarget(backendType string, results []CheckResult) (Target, 
 	var selected *CheckResult
 	for index := range results {
 		result := &results[index]
-		if !result.LoginOK || !strings.EqualFold(result.BackendType, backendType) {
+		if !result.LoginOK ||
+			result.Priority == 0 ||
+			result.Priority == 101 ||
+			!strings.EqualFold(result.BackendType, backendType) {
 			continue
 		}
-		if selected == nil || result.Priority > selected.Priority {
+		if selected == nil || result.Priority < selected.Priority {
 			selected = result
 		}
 	}
@@ -418,6 +463,49 @@ func (c *Client) BestTarget(backendType string, results []CheckResult) (Target, 
 		selected.Priority,
 	)
 	return target, nil
+}
+
+// TargetsForEchelon returns usable targets in ascending priority order.
+// Priority 0 is administratively disabled; 101 is marked full. Both are still
+// checked by PreCheck but never selected for upload.
+func (c *Client) TargetsForEchelon(
+	echelon int,
+	results []CheckResult,
+) []Target {
+	applog.Entry(
+		"rclone",
+		"TargetsForEchelon",
+		"echelon=%d results=%d",
+		echelon,
+		len(results),
+	)
+	filtered := make([]CheckResult, 0, len(results))
+	for _, result := range results {
+		if result.Echelon != echelon ||
+			!result.LoginOK ||
+			result.Priority == 0 ||
+			result.Priority == 101 {
+			continue
+		}
+		filtered = append(filtered, result)
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if filtered[i].Priority != filtered[j].Priority {
+			return filtered[i].Priority < filtered[j].Priority
+		}
+		if filtered[i].Provider != filtered[j].Provider {
+			return filtered[i].Provider < filtered[j].Provider
+		}
+		return filtered[i].Account < filtered[j].Account
+	})
+	targets := make([]Target, 0, len(filtered))
+	for _, result := range filtered {
+		targets = append(targets, Target{
+			Provider: result.Provider,
+			Account:  result.Account,
+		})
+	}
+	return targets
 }
 
 func (c *Client) AcceptsArchives(target Target) (bool, error) {
@@ -458,9 +546,45 @@ func (c *Client) Upload(
 	if len(sourcePaths) == 0 {
 		return errors.New("sourcePaths must not be empty")
 	}
+	files, err := c.CollectUploadItems(sourcePaths)
+	if err != nil {
+		return err
+	}
+	_, err = c.UploadItems(ctx, target, files, destination)
+	return err
+}
+
+// AvailableBytes returns the capacity measured during PreCheck. Nil means the
+// backend did not expose a byte quota and no maxUsageMB is configured.
+func (c *Client) AvailableBytes(target Target) (*int64, error) {
 	selected, ok := c.remotes[target]
 	if !ok {
-		return fmt.Errorf("rclone target %q/%q is not configured", target.Provider, target.Account)
+		return nil, fmt.Errorf(
+			"rclone target %q/%q is not configured",
+			target.Provider,
+			target.Account,
+		)
+	}
+	if selected.availableBytes == nil {
+		return nil, nil
+	}
+	value := *selected.availableBytes
+	return &value, nil
+}
+
+// UploadItems uploads an explicit subset while preserving each RelativePath.
+func (c *Client) UploadItems(
+	ctx context.Context,
+	target Target,
+	files []UploadItem,
+	destination string,
+) (int, error) {
+	selected, ok := c.remotes[target]
+	if !ok {
+		return 0, fmt.Errorf("rclone target %q/%q is not configured", target.Provider, target.Account)
+	}
+	if err := c.ensureUploadWithinLimit(ctx, selected, files); err != nil {
+		return 0, err
 	}
 
 	remoteRoot := joinRemotePath(selected.rootPath, destination)
@@ -472,16 +596,13 @@ func (c *Client) Upload(
 		"--config", c.configPath,
 		"mkdir", remoteDirectory,
 	); err != nil {
-		return fmt.Errorf("create remote directory %q: %w", remoteDirectory, err)
+		return 0, fmt.Errorf("create remote directory %q: %w", remoteDirectory, err)
 	}
 
-	files, err := collectUploadFiles(sourcePaths)
-	if err != nil {
-		return err
-	}
 	createdDirectories := map[string]struct{}{remoteDirectory: {}}
+	uploaded := 0
 	for _, file := range files {
-		relativeDirectory := filepath.Dir(file.relativePath)
+		relativeDirectory := filepath.Dir(file.RelativePath)
 		fileDirectory := remoteDirectory
 		if relativeDirectory != "." {
 			fileDirectory = selected.name + ":" + joinRemotePath(
@@ -496,7 +617,8 @@ func (c *Client) Upload(
 					"--config", c.configPath,
 					"mkdir", fileDirectory,
 				); err != nil {
-					return fmt.Errorf("create remote directory %q: %w", fileDirectory, err)
+					c.consumeAvailableBytes(target, files[:uploaded])
+					return uploaded, fmt.Errorf("create remote directory %q: %w", fileDirectory, err)
 				}
 				createdDirectories[fileDirectory] = struct{}{}
 			}
@@ -507,28 +629,125 @@ func (c *Client) Upload(
 			"--stats-one-line",
 			"copy",
 			"--no-traverse",
-			file.localPath,
+			file.LocalPath,
 			fileDirectory,
 		}
 		if err := c.runStreamingForRemote(ctx, selected, "Upload", args...); err != nil {
-			return fmt.Errorf("upload %q to %q: %w", file.localPath, fileDirectory, err)
+			c.consumeAvailableBytes(target, files[:uploaded])
+			return uploaded, fmt.Errorf("upload %q to %q: %w", file.LocalPath, fileDirectory, err)
 		}
+		uploaded++
+	}
+	c.consumeAvailableBytes(target, files)
+	return uploaded, nil
+}
+
+func (c *Client) consumeAvailableBytes(target Target, files []UploadItem) {
+	selected := c.remotes[target]
+	if selected.availableBytes == nil {
+		return
+	}
+	var uploadedBytes int64
+	for _, file := range files {
+		uploadedBytes += file.Size
+	}
+	remaining := *selected.availableBytes - uploadedBytes
+	if remaining < 0 {
+		remaining = 0
+	}
+	selected.availableBytes = &remaining
+	c.remotes[target] = selected
+}
+
+func (c *Client) ensureUploadWithinLimit(
+	ctx context.Context,
+	selected remote,
+	files []UploadItem,
+) error {
+	var uploadBytes int64
+	for _, file := range files {
+		uploadBytes += file.Size
+	}
+	if selected.availableBytes != nil && uploadBytes > *selected.availableBytes {
+		return fmt.Errorf(
+			"upload size %s exceeds available capacity %s",
+			formatBytes(uploadBytes),
+			formatBytes(*selected.availableBytes),
+		)
+	}
+	if selected.maxUsageBytes <= 0 {
+		return nil
+	}
+	usedBytes, err := c.remoteUsedBytes(ctx, selected)
+	if err != nil {
+		return fmt.Errorf("check usage limit: %w", err)
+	}
+	projected := usedBytes + uploadBytes
+	applog.Entry(
+		"rclone",
+		"ensureUploadWithinLimit",
+		"used=%d upload=%d projected=%d max=%d",
+		usedBytes,
+		uploadBytes,
+		projected,
+		selected.maxUsageBytes,
+	)
+	if projected > selected.maxUsageBytes {
+		return fmt.Errorf(
+			"upload would exceed maxUsageMB=%d (used=%s, upload=%s, limit=%s)",
+			selected.maxUsageBytes/(1024*1024),
+			formatBytes(usedBytes),
+			formatBytes(uploadBytes),
+			formatBytes(selected.maxUsageBytes),
+		)
 	}
 	return nil
 }
 
-func collectUploadFiles(sourcePaths []string) ([]uploadFile, error) {
-	applog.Entry("rclone", "collectUploadFiles", "sourcePaths=%v", sourcePaths)
-	var files []uploadFile
+func (c *Client) remoteUsedBytes(ctx context.Context, selected remote) (int64, error) {
+	remotePath := aboutRemotePath(selected)
+	output, err := c.runCaptureForRemote(ctx, selected, "-vv", "size", "--json", remotePath)
+	if err != nil {
+		return 0, err
+	}
+	var size remoteSize
+	if err := json.Unmarshal(output, &size); err != nil {
+		return 0, fmt.Errorf("decode remote size: %w", err)
+	}
+	return size.Bytes, nil
+}
+
+func aboutRemotePath(selected remote) string {
+	if selected.rootPath == "" {
+		return selected.name + ":"
+	}
+	// For S3-compatible backends quota is reported on the bucket.
+	bucket, _, _ := strings.Cut(selected.rootPath, "/")
+	return selected.name + ":" + bucket
+}
+
+func (c *Client) CollectUploadItems(sourcePaths []string) ([]UploadItem, error) {
+	applog.Entry("rclone", "CollectUploadItems", "sourcePaths=%v", sourcePaths)
+	var files []UploadItem
 	for _, sourcePath := range sourcePaths {
 		info, err := os.Stat(sourcePath)
+		if os.IsNotExist(err) {
+			applog.Entry(
+				"rclone",
+				"CollectUploadItems",
+				"skip missing source=%s",
+				sourcePath,
+			)
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("inspect upload source %q: %w", sourcePath, err)
 		}
 		if !info.IsDir() {
-			files = append(files, uploadFile{
-				localPath:    sourcePath,
-				relativePath: filepath.Base(sourcePath),
+			files = append(files, UploadItem{
+				LocalPath:    sourcePath,
+				RelativePath: filepath.Base(sourcePath),
+				Size:         info.Size(),
 			})
 			continue
 		}
@@ -546,9 +765,14 @@ func collectUploadFiles(sourcePaths []string) ([]uploadFile, error) {
 			if err != nil {
 				return err
 			}
-			files = append(files, uploadFile{
-				localPath:    path,
-				relativePath: relativePath,
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			files = append(files, UploadItem{
+				LocalPath:    path,
+				RelativePath: relativePath,
+				Size:         info.Size(),
 			})
 			return nil
 		})
@@ -557,9 +781,9 @@ func collectUploadFiles(sourcePaths []string) ([]uploadFile, error) {
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
-		return files[i].localPath < files[j].localPath
+		return files[i].LocalPath < files[j].LocalPath
 	})
-	applog.Entry("rclone", "collectUploadFiles", "files=%d", len(files))
+	applog.Entry("rclone", "CollectUploadItems", "files=%d", len(files))
 	return files, nil
 }
 
@@ -579,6 +803,8 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 		Account:     target.Account,
 		BackendType: selected.backendType,
 		Priority:    selected.priority,
+		Echelon:     selected.echelon,
+		MaxUsageMB:  selected.maxUsageBytes / (1024 * 1024),
 	}
 	if strings.EqualFold(selected.backendType, "cloudinary") {
 		usage, err := c.fetchCloudinaryUsage(ctx, selected)
@@ -633,7 +859,7 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 	}
 
 	// Check the remote root: configured upload folders may not exist yet.
-	remotePath := selected.name + ":"
+	remotePath := aboutRemotePath(selected)
 	applog.Entry("rclone", "checkRemote", "step=about start remote=%s", remotePath)
 	output, err := c.runCaptureForRemote(ctx, selected, "-vv", "about", "--json", remotePath)
 	if err == nil {
@@ -646,12 +872,21 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 		}
 		result.LoginOK = true
 		result.FreeBytes = remoteQuota.Free
+		result.UsedBytes = remoteQuota.Used
+		if err := c.applyUsageLimit(ctx, selected, &result); err != nil {
+			result.LoginOK = false
+			result.Error = compactError(err)
+		}
 		return result
 	}
 	applog.Entry("rclone", "checkRemote", "step=about failed err=%v fallback=lsd", err)
 
 	// Some backends authenticate correctly but do not implement About.
-	applog.Entry("rclone", "checkRemote", "step=lsd start remote=%s maxDepth=1", remotePath)
+	listPath := selected.name + ":"
+	if selected.rootPath != "" {
+		listPath = selected.name + ":" + selected.rootPath
+	}
+	applog.Entry("rclone", "checkRemote", "step=lsd start remote=%s maxDepth=1", listPath)
 	_, listErr := c.runCaptureForRemote(
 		ctx,
 		selected,
@@ -659,16 +894,48 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 		"lsd",
 		"--max-depth",
 		"1",
-		remotePath,
+		listPath,
 	)
 	if listErr == nil {
 		applog.Entry("rclone", "checkRemote", "step=lsd success login=OK")
 		result.LoginOK = true
+		if err := c.applyUsageLimit(ctx, selected, &result); err != nil {
+			result.LoginOK = false
+			result.Error = compactError(err)
+		}
 		return result
 	}
 	applog.Entry("rclone", "checkRemote", "step=lsd failed login=ERROR err=%v", listErr)
 	result.Error = compactError(listErr)
 	return result
+}
+
+func (c *Client) applyUsageLimit(
+	ctx context.Context,
+	selected remote,
+	result *CheckResult,
+) error {
+	if selected.maxUsageBytes <= 0 {
+		return nil
+	}
+	used, err := c.remoteUsedBytes(ctx, selected)
+	if err != nil {
+		return fmt.Errorf("measure remote usage with rclone size: %w", err)
+	}
+	result.UsedBytes = &used
+	result.Usage = fmt.Sprintf(
+		"%s / %s (лимит)",
+		formatBytes(used),
+		formatBytes(selected.maxUsageBytes),
+	)
+	if used >= selected.maxUsageBytes {
+		return fmt.Errorf(
+			"maxUsageMB=%d exceeded (used=%s)",
+			selected.maxUsageBytes/(1024*1024),
+			formatBytes(used),
+		)
+	}
+	return nil
 }
 
 func (c *Client) fetchCloudinaryUsage(
@@ -818,8 +1085,14 @@ func buildConfig(config Config) (map[Target]remote, []byte, error) {
 		if strings.TrimSpace(provider.Type) == "" {
 			return nil, nil, fmt.Errorf("provider %q type is required", provider.Name)
 		}
-		if provider.Priority < 1 || provider.Priority > 100 {
-			return nil, nil, fmt.Errorf("provider %q priority must be between 1 and 100", provider.Name)
+		if provider.Priority < 0 || provider.Priority > 101 {
+			return nil, nil, fmt.Errorf("provider %q priority must be between 0 and 101", provider.Name)
+		}
+		if provider.Echelon < 1 || provider.Echelon > 3 {
+			return nil, nil, fmt.Errorf("provider %q echelon must be between 1 and 3", provider.Name)
+		}
+		if provider.MaxUsageMB < 0 {
+			return nil, nil, fmt.Errorf("provider %q maxUsageMB must be >= 0", provider.Name)
 		}
 		providerKey := strings.ToLower(provider.Name)
 		if _, exists := providerNames[providerKey]; exists {
@@ -858,16 +1131,18 @@ func buildConfig(config Config) (map[Target]remote, []byte, error) {
 				tokenFile = account.OAuth.TokenFile
 			}
 			remotes[target] = remote{
-				name:        remoteName,
-				backendType: provider.Type,
-				rootPath:    cleanRemotePath(account.RootPath),
-				priority:    provider.Priority,
-				archives:    provider.AcceptsArchives,
-				cloudName:   account.Options["cloud_name"],
-				apiKey:      account.Options["api_key"],
-				apiSecret:   account.Options["api_secret"],
-				tokenFile:   tokenFile,
-				twoFactor:   account.TwoFactor,
+				name:          remoteName,
+				backendType:   provider.Type,
+				rootPath:      cleanRemotePath(account.RootPath),
+				priority:      provider.Priority,
+				echelon:       provider.Echelon,
+				archives:      provider.AcceptsArchives,
+				maxUsageBytes: provider.MaxUsageMB * 1024 * 1024,
+				cloudName:     account.Options["cloud_name"],
+				apiKey:        account.Options["api_key"],
+				apiSecret:     account.Options["api_secret"],
+				tokenFile:     tokenFile,
+				twoFactor:     account.TwoFactor,
 			}
 
 			content.WriteString("[")
@@ -968,19 +1243,30 @@ func validateConfigValue(key, value string) error {
 
 func logCheckTable(results []CheckResult) {
 	applog.Entry("rclone", "logCheckTable", "results=%d", len(results))
-	applog.Entry(
-		"rclone",
-		"PreCheck",
-		"%-20s | %-20s | %-12s | %s",
+	stamp := time.Now().Format("2006-01-02 15:04:05")
+	applog.Availability("")
+	applog.Availability("=== PreCheck %s ===", stamp)
+	header := fmt.Sprintf(
+		"%-7s | %-9s | %-20s | %-20s | %-12s | %s",
+		"ЭШЕЛОН",
+		"ПРИОРИТЕТ",
 		"ОБЛАКО",
 		"АККАУНТ",
-		"ЛОГИН",
+		"СТАТУС",
 		"КВОТА / КРЕДИТЫ",
 	)
+	applog.Entry("rclone", "PreCheck", "%s", header)
+	applog.Availability("%s", header)
 	for _, result := range results {
 		status := "OK"
 		if !result.LoginOK {
 			status = "ОШИБКА"
+		}
+		switch result.Priority {
+		case 0:
+			status = "ОТКЛЮЧЕН"
+		case 101:
+			status = "ЗАПОЛНЕН"
 		}
 		free := "не поддерживается"
 		if result.FreeBytes != nil {
@@ -988,19 +1274,27 @@ func logCheckTable(results []CheckResult) {
 		}
 		if result.Usage != "" {
 			free = result.Usage
+		} else if result.UsedBytes != nil && result.MaxUsageMB > 0 {
+			free = fmt.Sprintf(
+				"%s / %s (лимит)",
+				formatBytes(*result.UsedBytes),
+				formatBytes(result.MaxUsageMB*1024*1024),
+			)
 		}
 		if result.Error != "" {
 			free = result.Error
 		}
-		applog.Entry(
-			"rclone",
-			"PreCheck",
-			"%-20s | %-20s | %-12s | %s",
+		line := fmt.Sprintf(
+			"%-7d | %-9d | %-20s | %-20s | %-12s | %s",
+			result.Echelon,
+			result.Priority,
 			result.Provider,
 			result.Account,
 			status,
 			free,
 		)
+		applog.Entry("rclone", "PreCheck", "%s", line)
+		applog.Availability("%s", line)
 	}
 }
 

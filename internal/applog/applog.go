@@ -1,6 +1,7 @@
 package applog
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,10 +12,11 @@ import (
 )
 
 var (
-	mu        sync.Mutex
-	writer    io.Writer
-	file      *os.File
-	errorPath string
+	mu               sync.Mutex
+	writer           io.Writer
+	file             *os.File
+	availabilityFile *os.File
+	errorPath        string
 )
 
 func Init() error {
@@ -30,6 +32,7 @@ func Init() error {
 	baseName := strings.TrimSuffix(filepath.Base(executable), filepath.Ext(executable))
 	executableDir := filepath.Dir(executable)
 	logPath := filepath.Join(executableDir, baseName+".log")
+	availabilityPath := filepath.Join(executableDir, "availability.log")
 	errorPath = filepath.Join(executableDir, baseName+".error")
 	if err := os.Remove(errorPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove previous error marker %q: %w", errorPath, err)
@@ -39,13 +42,30 @@ func Init() error {
 	if err != nil {
 		return fmt.Errorf("open log file %q: %w", logPath, err)
 	}
+	availabilityLog, err := os.OpenFile(
+		availabilityPath,
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY,
+		0o644,
+	)
+	if err != nil {
+		logFile.Close()
+		return fmt.Errorf("open availability log %q: %w", availabilityPath, err)
+	}
 
 	mu.Lock()
 	file = logFile
+	availabilityFile = availabilityLog
 	writer = io.MultiWriter(os.Stdout, logFile)
 	mu.Unlock()
 
-	Entry("applog", "Init", "logPath=%s errorPath=%s", logPath, errorPath)
+	Entry(
+		"applog",
+		"Init",
+		"logPath=%s availabilityPath=%s errorPath=%s",
+		logPath,
+		availabilityPath,
+		errorPath,
+	)
 	return nil
 }
 
@@ -57,7 +77,11 @@ func Close() error {
 		return nil
 	}
 	err := file.Close()
+	if availabilityFile != nil {
+		err = errors.Join(err, availabilityFile.Close())
+	}
 	file = nil
+	availabilityFile = nil
 	writer = nil
 	return err
 }
@@ -86,6 +110,16 @@ func Error(module, function string, err error) {
 		return
 	}
 	Entry(module, function, "error: %v", err)
+}
+
+// Availability writes one line to availability.log only.
+func Availability(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	mu.Lock()
+	defer mu.Unlock()
+	if availabilityFile != nil {
+		fmt.Fprintln(availabilityFile, line)
+	}
 }
 
 // WriteErrorMarker creates {binary}.error with the failure text.

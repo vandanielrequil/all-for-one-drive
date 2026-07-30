@@ -17,6 +17,8 @@ import (
 )
 
 type Config struct {
+	Replication    int                   `json:"replication"`
+	Echelon        int                   `json:"echelon"`
 	Archive        bool                  `json:"archive"`
 	ImageConverter imageconverter.Config `json:"imageConverter"`
 	VideoConverter videoconverter.Config `json:"videoConverter"`
@@ -44,6 +46,18 @@ func Load(path string) (Config, error) {
 	}
 	if err := ensureEOF(decoder); err != nil {
 		return Config{}, err
+	}
+	if result.Replication == 0 {
+		result.Replication = 3
+	}
+	if result.Echelon == 0 {
+		result.Echelon = 1
+	}
+	if result.Replication < 1 || result.Replication > 3 {
+		return Config{}, errors.New("replication must be between 1 and 3")
+	}
+	if result.Echelon < 1 || result.Echelon > 3 {
+		return Config{}, errors.New("echelon must be between 1 and 3")
 	}
 
 	configPath, err := filepath.Abs(path)
