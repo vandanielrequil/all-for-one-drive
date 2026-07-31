@@ -39,6 +39,23 @@
       //     }
       //   }]
       // },
+      // Box.com OAuth; Redirect URI: http://localhost:53682/
+      // {
+      //   "name": "box",
+      //   "type": "box",
+      //   "echelon": 2,
+      //   "priority": 1,
+      //   "acceptsArchives": true,
+      //   "accounts": [{
+      //     "name": "personal",
+      //     "rootPath": "",
+      //     "oauth": { "tokenFile": "./box-personal.oauth-token" },
+      //     "options": {
+      //       "client_id": "BOX_CLIENT_ID",
+      //       "client_secret": "BOX_CLIENT_SECRET"
+      //     }
+      //   }]
+      // },
       // Cloudflare R2 через rclone s3 (не Cloudflare API)
       // {
       //   "name": "cloudflare-r2",
@@ -56,6 +73,24 @@
       //       "secret_access_key": "R2_SECRET_ACCESS_KEY",
       //       "endpoint": "https://ACCOUNT_ID.r2.cloudflarestorage.com",
       //       "acl": "private"
+      //     }
+      //   }]
+      // },
+      // Storj (S3 gateway)
+      // {
+      //   "name": "storj",
+      //   "type": "s3",
+      //   "echelon": 2,
+      //   "priority": 1,
+      //   "acceptsArchives": true,
+      //   "accounts": [{
+      //     "name": "all-for-one-key",
+      //     "rootPath": "all-for-one", // bucket name
+      //     "options": {
+      //       "provider": "Storj",
+      //       "access_key_id": "ACCESS_KEY",
+      //       "secret_access_key": "SECRET_KEY",
+      //       "endpoint": "https://gateway.storjshare.io"
       //     }
       //   }]
       // },
@@ -138,13 +173,13 @@
       // {
       //   "name": "mega",
       //   "type": "mega",
-      //   "echelon": 2,
-      //   "priority": 60,
+      //   "echelon": 1,
+      //   "priority": 1,
       //   "acceptsArchives": true,
       //   "accounts": [{
       //     "name": "personal",
-      //     "rootPath": "all-for-one-drive",
-      //     "twoFactor": {
+      //     "rootPath": "",
+      //     "twoFactor": { // только если на аккаунте включён 2FA
       //       "secret": "BASE32_TOTP_SECRET",
       //       "outputFile": "./mega-personal.otp",
       //       "rcloneOption": "2fa"

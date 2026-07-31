@@ -873,7 +873,7 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 		result.LoginOK = true
 		result.FreeBytes = remoteQuota.Free
 		result.UsedBytes = remoteQuota.Used
-		if err := c.applyUsageLimit(ctx, selected, &result); err != nil {
+		if err := c.fillUsage(ctx, selected, &result); err != nil {
 			result.LoginOK = false
 			result.Error = compactError(err)
 		}
@@ -899,7 +899,7 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 	if listErr == nil {
 		applog.Entry("rclone", "checkRemote", "step=lsd success login=OK")
 		result.LoginOK = true
-		if err := c.applyUsageLimit(ctx, selected, &result); err != nil {
+		if err := c.fillUsage(ctx, selected, &result); err != nil {
 			result.LoginOK = false
 			result.Error = compactError(err)
 		}
@@ -910,31 +910,47 @@ func (c *Client) checkRemote(ctx context.Context, target Target) CheckResult {
 	return result
 }
 
-func (c *Client) applyUsageLimit(
+// fillUsage measures occupancy with rclone size when About has no used bytes
+// (S3/Storj/R2) and optionally enforces maxUsageMB.
+func (c *Client) fillUsage(
 	ctx context.Context,
 	selected remote,
 	result *CheckResult,
 ) error {
-	if selected.maxUsageBytes <= 0 {
+	needSize := selected.maxUsageBytes > 0 || result.UsedBytes == nil
+	if !needSize {
 		return nil
 	}
 	used, err := c.remoteUsedBytes(ctx, selected)
 	if err != nil {
-		return fmt.Errorf("measure remote usage with rclone size: %w", err)
+		if selected.maxUsageBytes > 0 {
+			return fmt.Errorf("measure remote usage with rclone size: %w", err)
+		}
+		applog.Entry(
+			"rclone",
+			"fillUsage",
+			"size unavailable err=%v",
+			err,
+		)
+		return nil
 	}
 	result.UsedBytes = &used
-	result.Usage = fmt.Sprintf(
-		"%s / %s (лимит)",
-		formatBytes(used),
-		formatBytes(selected.maxUsageBytes),
-	)
-	if used >= selected.maxUsageBytes {
-		return fmt.Errorf(
-			"maxUsageMB=%d exceeded (used=%s)",
-			selected.maxUsageBytes/(1024*1024),
+	if selected.maxUsageBytes > 0 {
+		result.Usage = fmt.Sprintf(
+			"%s / %s (лимит)",
 			formatBytes(used),
+			formatBytes(selected.maxUsageBytes),
 		)
+		if used >= selected.maxUsageBytes {
+			return fmt.Errorf(
+				"maxUsageMB=%d exceeded (used=%s)",
+				selected.maxUsageBytes/(1024*1024),
+				formatBytes(used),
+			)
+		}
+		return nil
 	}
+	result.Usage = fmt.Sprintf("%s занято", formatBytes(used))
 	return nil
 }
 
