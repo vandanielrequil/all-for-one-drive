@@ -308,11 +308,10 @@ func uploadReplicas(
 	directSources []string,
 ) error {
 	for _, plan := range plans {
-		firstAcceptsArchives, err := client.AcceptsArchives(plan.targets[0])
+		useArchives, err := echelonUsesArchives(client, plan.targets, archiveEnabled)
 		if err != nil {
 			return err
 		}
-		useArchives := archiveEnabled && firstAcceptsArchives
 		sources := directSources
 		representation := "direct"
 		if useArchives {
@@ -340,11 +339,12 @@ func uploadReplicas(
 				attemptErrors = errors.Join(attemptErrors, err)
 				continue
 			}
-			if archiveEnabled && acceptsArchives != useArchives {
+			// Архивы — только на acceptsArchives; прямые файлы принимают все.
+			if useArchives && !acceptsArchives {
 				applog.Entry(
 					"convert-and-upload",
 					"uploadReplicas",
-					"echelon=%d provider=%s skipped incompatible archive capability",
+					"echelon=%d provider=%s skipped: archives required but acceptsArchives=false",
 					plan.echelon,
 					target.Provider,
 				)
@@ -355,20 +355,28 @@ func uploadReplicas(
 				attemptErrors = errors.Join(attemptErrors, err)
 				continue
 			}
-			selected, deferred := fitUploadItems(remaining, available)
+			maxFileSize, err := client.MaxFileSizeBytes(target)
+			if err != nil {
+				attemptErrors = errors.Join(attemptErrors, err)
+				continue
+			}
+			selected, deferred := fitUploadItems(remaining, available, maxFileSize)
 			if len(selected) == 0 && len(remaining) > 0 {
 				applog.Entry(
 					"convert-and-upload",
 					"uploadReplicas",
-					"echelon=%d provider=%s account=%s no files fit",
+					"echelon=%d provider=%s account=%s no files fit (quota or maxFileSize)",
 					plan.echelon,
 					target.Provider,
 					target.Account,
 				)
-				attemptErrors = errors.Join(
-					attemptErrors,
-					fmt.Errorf("%s/%s: no remaining file fits", target.Provider, target.Account),
-				)
+				remaining = deferred
+				if len(deferred) == 0 {
+					attemptErrors = errors.Join(
+						attemptErrors,
+						fmt.Errorf("%s/%s: no remaining file fits", target.Provider, target.Account),
+					)
+				}
 				continue
 			}
 			applog.Entry(
@@ -429,21 +437,51 @@ func uploadReplicas(
 	return nil
 }
 
+func echelonUsesArchives(
+	client *rcloneclient.Client,
+	targets []rcloneclient.Target,
+	archiveEnabled bool,
+) (bool, error) {
+	if !archiveEnabled {
+		return false, nil
+	}
+	for _, target := range targets {
+		accepts, err := client.AcceptsArchives(target)
+		if err != nil {
+			return false, err
+		}
+		if accepts {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func fitUploadItems(
 	items []rcloneclient.UploadItem,
 	available *int64,
+	maxFileSize *int64,
 ) (selected []rcloneclient.UploadItem, deferred []rcloneclient.UploadItem) {
-	if available == nil {
-		return append([]rcloneclient.UploadItem(nil), items...), nil
+	var remainingBytes int64
+	limitBytes := available != nil
+	if limitBytes {
+		remainingBytes = *available
 	}
-	remainingBytes := *available
 	for _, item := range items {
-		if item.Size <= remainingBytes {
-			selected = append(selected, item)
-			remainingBytes -= item.Size
-		} else {
+		if maxFileSize != nil && item.Size > *maxFileSize {
 			deferred = append(deferred, item)
+			continue
 		}
+		if limitBytes {
+			if item.Size <= remainingBytes {
+				selected = append(selected, item)
+				remainingBytes -= item.Size
+			} else {
+				deferred = append(deferred, item)
+			}
+			continue
+		}
+		selected = append(selected, item)
 	}
 	return selected, deferred
 }
@@ -532,6 +570,11 @@ func copyFile(source, destination string) error {
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(destination)
 		return errors.Join(copyErr, closeErr)
+	}
+	modTime := info.ModTime()
+	if err := os.Chtimes(destination, modTime, modTime); err != nil {
+		_ = os.Remove(destination)
+		return err
 	}
 	return nil
 }

@@ -34,12 +34,14 @@ type Provider struct {
 	Priority        int       `json:"priority"`
 	Echelon         int       `json:"echelon"`
 	AcceptsArchives bool      `json:"acceptsArchives"`
-	MaxUsageMB      int64     `json:"maxUsageMB"` // 0 = без лимита; жёсткий потолок по rclone size
+	MaxUsageMB      int64     `json:"maxUsageMB"`    // 0 = без лимита; жёсткий потолок по rclone size
+	MaxFileSizeMB   int64     `json:"maxFileSizeMB"` // 0 = без лимита; файлы больше — skip/spillover (Box free = 250)
 	Accounts        []Account `json:"accounts"`
 }
 
 type Account struct {
 	Name      string            `json:"name"`
+	Email     string            `json:"email"` // только для человека; программа не использует
 	RootPath  string            `json:"rootPath"`
 	Options   map[string]string `json:"options"`
 	OAuth     *OAuthConfig      `json:"oauth,omitempty"`
@@ -83,6 +85,7 @@ type remote struct {
 	echelon        int
 	archives       bool
 	maxUsageBytes  int64
+	maxFileBytes   int64
 	availableBytes *int64
 	cloudName      string
 	apiKey         string
@@ -572,6 +575,23 @@ func (c *Client) AvailableBytes(target Target) (*int64, error) {
 	return &value, nil
 }
 
+// MaxFileSizeBytes returns the per-file upload limit. Nil means unlimited.
+func (c *Client) MaxFileSizeBytes(target Target) (*int64, error) {
+	selected, ok := c.remotes[target]
+	if !ok {
+		return nil, fmt.Errorf(
+			"rclone target %q/%q is not configured",
+			target.Provider,
+			target.Account,
+		)
+	}
+	if selected.maxFileBytes <= 0 {
+		return nil, nil
+	}
+	value := selected.maxFileBytes
+	return &value, nil
+}
+
 // UploadItems uploads an explicit subset while preserving each RelativePath.
 func (c *Client) UploadItems(
 	ctx context.Context,
@@ -601,7 +621,17 @@ func (c *Client) UploadItems(
 
 	createdDirectories := map[string]struct{}{remoteDirectory: {}}
 	uploaded := 0
+	var uploadedFiles []UploadItem
 	for _, file := range files {
+		if selected.maxFileBytes > 0 && file.Size > selected.maxFileBytes {
+			c.consumeAvailableBytes(target, uploadedFiles)
+			return uploaded, fmt.Errorf(
+				"file %q (%s) exceeds maxFileSizeMB=%d",
+				file.LocalPath,
+				formatBytes(file.Size),
+				selected.maxFileBytes/(1024*1024),
+			)
+		}
 		relativeDirectory := filepath.Dir(file.RelativePath)
 		fileDirectory := remoteDirectory
 		if relativeDirectory != "." {
@@ -617,28 +647,33 @@ func (c *Client) UploadItems(
 					"--config", c.configPath,
 					"mkdir", fileDirectory,
 				); err != nil {
-					c.consumeAvailableBytes(target, files[:uploaded])
+					c.consumeAvailableBytes(target, uploadedFiles)
 					return uploaded, fmt.Errorf("create remote directory %q: %w", fileDirectory, err)
 				}
 				createdDirectories[fileDirectory] = struct{}{}
 			}
 		}
+		// transfers=4 — безопасный дефолт rclone; не разгоняем API rate limits
+		// metadata — сохраняем mtime/метаданные, чтобы в облаке была хронология съёмки
 		args := []string{
 			"--config", c.configPath,
+			"--transfers", "4",
 			"--stats", "5s",
 			"--stats-one-line",
 			"copy",
+			"--metadata",
 			"--no-traverse",
 			file.LocalPath,
 			fileDirectory,
 		}
 		if err := c.runStreamingForRemote(ctx, selected, "Upload", args...); err != nil {
-			c.consumeAvailableBytes(target, files[:uploaded])
+			c.consumeAvailableBytes(target, uploadedFiles)
 			return uploaded, fmt.Errorf("upload %q to %q: %w", file.LocalPath, fileDirectory, err)
 		}
 		uploaded++
+		uploadedFiles = append(uploadedFiles, file)
 	}
-	c.consumeAvailableBytes(target, files)
+	c.consumeAvailableBytes(target, uploadedFiles)
 	return uploaded, nil
 }
 
@@ -1110,6 +1145,9 @@ func buildConfig(config Config) (map[Target]remote, []byte, error) {
 		if provider.MaxUsageMB < 0 {
 			return nil, nil, fmt.Errorf("provider %q maxUsageMB must be >= 0", provider.Name)
 		}
+		if provider.MaxFileSizeMB < 0 {
+			return nil, nil, fmt.Errorf("provider %q maxFileSizeMB must be >= 0", provider.Name)
+		}
 		providerKey := strings.ToLower(provider.Name)
 		if _, exists := providerNames[providerKey]; exists {
 			return nil, nil, fmt.Errorf("duplicate provider name %q", provider.Name)
@@ -1154,6 +1192,7 @@ func buildConfig(config Config) (map[Target]remote, []byte, error) {
 				echelon:       provider.Echelon,
 				archives:      provider.AcceptsArchives,
 				maxUsageBytes: provider.MaxUsageMB * 1024 * 1024,
+				maxFileBytes:  provider.MaxFileSizeMB * 1024 * 1024,
 				cloudName:     account.Options["cloud_name"],
 				apiKey:        account.Options["api_key"],
 				apiSecret:     account.Options["api_secret"],

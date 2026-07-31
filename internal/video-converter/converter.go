@@ -206,6 +206,12 @@ func (c *Converter) convertFile(ctx context.Context, sourcePath string) (outputP
 	if err := os.Rename(tempPath, outputPath); err != nil {
 		return outputPath, false, fmt.Errorf("publish output: %w", err)
 	}
+	if sourceInfo, statErr := os.Stat(sourcePath); statErr == nil {
+		modTime := sourceInfo.ModTime()
+		if err := os.Chtimes(outputPath, modTime, modTime); err != nil {
+			return outputPath, false, fmt.Errorf("preserve modtime: %w", err)
+		}
+	}
 	return outputPath, false, nil
 }
 
