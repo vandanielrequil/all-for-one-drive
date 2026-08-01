@@ -26,6 +26,8 @@ import (
 type Config struct {
 	Providers []Provider `json:"providers"`
 	UploadDir string     `json:"uploadDir"`
+	Transfers int        `json:"transfers"` // rclone --transfers; 0 → 4
+	BatchSize int        `json:"batchSize"` // файлов на один rclone copy; 0 → 32
 }
 
 type Provider struct {
@@ -74,6 +76,8 @@ type CheckResult struct {
 type Client struct {
 	binary     string
 	configPath string
+	transfers  int
+	batchSize  int
 	remotes    map[Target]remote
 }
 
@@ -128,6 +132,20 @@ func New(ctx context.Context, config Config) (*Client, error) {
 	if strings.TrimSpace(config.UploadDir) == "" {
 		return nil, errors.New("uploadDir is required")
 	}
+	transfers := config.Transfers
+	if transfers == 0 {
+		transfers = 4
+	}
+	if transfers < 1 {
+		return nil, errors.New("transfers must be greater than zero")
+	}
+	batchSize := config.BatchSize
+	if batchSize == 0 {
+		batchSize = 32
+	}
+	if batchSize < 1 {
+		return nil, errors.New("batchSize must be greater than zero")
+	}
 
 	binary, err := exec.LookPath("rclone")
 	if err != nil {
@@ -173,14 +191,18 @@ func New(ctx context.Context, config Config) (*Client, error) {
 	applog.Entry(
 		"rclone",
 		"New",
-		"binary=%s configPath=%s remotes=%d",
+		"binary=%s configPath=%s transfers=%d batchSize=%d remotes=%d",
 		binary,
 		configPath,
+		transfers,
+		batchSize,
 		len(remotes),
 	)
 	return &Client{
 		binary:     binary,
 		configPath: configPath,
+		transfers:  transfers,
+		batchSize:  batchSize,
 		remotes:    remotes,
 	}, nil
 }
@@ -594,6 +616,7 @@ func (c *Client) MaxFileSizeBytes(target Target) (*int64, error) {
 }
 
 // UploadItems uploads an explicit subset while preserving each RelativePath.
+// Files go to rclone in batches (batchSize); --transfers controls parallelism inside each batch.
 func (c *Client) UploadItems(
 	ctx context.Context,
 	target Target,
@@ -606,6 +629,16 @@ func (c *Client) UploadItems(
 	}
 	if err := c.ensureUploadWithinLimit(ctx, selected, files); err != nil {
 		return 0, err
+	}
+	for _, file := range files {
+		if selected.maxFileBytes > 0 && file.Size > selected.maxFileBytes {
+			return 0, fmt.Errorf(
+				"file %q (%s) exceeds maxFileSizeMB=%d",
+				file.LocalPath,
+				formatBytes(file.Size),
+				selected.maxFileBytes/(1024*1024),
+			)
+		}
 	}
 
 	remoteRoot := joinRemotePath(selected.rootPath, destination)
@@ -620,66 +653,117 @@ func (c *Client) UploadItems(
 		return 0, fmt.Errorf("create remote directory %q: %w", remoteDirectory, err)
 	}
 
-	createdDirectories := map[string]struct{}{remoteDirectory: {}}
 	uploaded := 0
 	var uploadedFiles []UploadItem
-	for _, file := range files {
-		if selected.maxFileBytes > 0 && file.Size > selected.maxFileBytes {
-			c.consumeAvailableBytes(target, uploadedFiles)
-			appendUploadMap(target.Provider, selected.email, uploadedFiles)
-			return uploaded, fmt.Errorf(
-				"file %q (%s) exceeds maxFileSizeMB=%d",
-				file.LocalPath,
-				formatBytes(file.Size),
-				selected.maxFileBytes/(1024*1024),
-			)
-		}
-		relativeDirectory := filepath.Dir(file.RelativePath)
-		fileDirectory := remoteDirectory
-		if relativeDirectory != "." {
-			fileDirectory = selected.name + ":" + joinRemotePath(
-				remoteRoot,
-				relativeDirectory,
-			)
-			if _, exists := createdDirectories[fileDirectory]; !exists {
-				if err := c.runStreamingForRemote(
-					ctx,
-					selected,
-					"Upload.mkdir",
-					"--config", c.configPath,
-					"mkdir", fileDirectory,
-				); err != nil {
-					c.consumeAvailableBytes(target, uploadedFiles)
-					appendUploadMap(target.Provider, selected.email, uploadedFiles)
-					return uploaded, fmt.Errorf("create remote directory %q: %w", fileDirectory, err)
-				}
-				createdDirectories[fileDirectory] = struct{}{}
+	for _, rootGroup := range groupUploadItemsByRoot(files) {
+		for start := 0; start < len(rootGroup.files); start += c.batchSize {
+			end := start + c.batchSize
+			if end > len(rootGroup.files) {
+				end = len(rootGroup.files)
 			}
+			batch := rootGroup.files[start:end]
+			filesFromPath, err := writeFilesFromList(batch)
+			if err != nil {
+				c.consumeAvailableBytes(target, uploadedFiles)
+				appendUploadMap(target.Provider, selected.email, uploadedFiles)
+				return uploaded, err
+			}
+			applog.Entry(
+				"rclone",
+				"Upload.batch",
+				"root=%s remote=%s files=%d transfers=%d",
+				rootGroup.root,
+				remoteDirectory,
+				len(batch),
+				c.transfers,
+			)
+			// transfers — параллелизм внутри пачки; metadata — mtime/хронология съёмки
+			args := []string{
+				"--config", c.configPath,
+				"--transfers", strconv.Itoa(c.transfers),
+				"--stats", "5s",
+				"--stats-one-line",
+				"copy",
+				"--metadata",
+				"--no-traverse",
+				"--files-from", filesFromPath,
+				rootGroup.root,
+				remoteDirectory,
+			}
+			err = c.runStreamingForRemote(ctx, selected, "Upload", args...)
+			_ = os.Remove(filesFromPath)
+			if err != nil {
+				c.consumeAvailableBytes(target, uploadedFiles)
+				appendUploadMap(target.Provider, selected.email, uploadedFiles)
+				return uploaded, fmt.Errorf(
+					"upload batch (%d files) from %q to %q: %w",
+					len(batch),
+					rootGroup.root,
+					remoteDirectory,
+					err,
+				)
+			}
+			uploaded += len(batch)
+			uploadedFiles = append(uploadedFiles, batch...)
 		}
-		// transfers=4 — безопасный дефолт rclone; не разгоняем API rate limits
-		// metadata — сохраняем mtime/метаданные, чтобы в облаке была хронология съёмки
-		args := []string{
-			"--config", c.configPath,
-			"--transfers", "4",
-			"--stats", "5s",
-			"--stats-one-line",
-			"copy",
-			"--metadata",
-			"--no-traverse",
-			file.LocalPath,
-			fileDirectory,
-		}
-		if err := c.runStreamingForRemote(ctx, selected, "Upload", args...); err != nil {
-			c.consumeAvailableBytes(target, uploadedFiles)
-			appendUploadMap(target.Provider, selected.email, uploadedFiles)
-			return uploaded, fmt.Errorf("upload %q to %q: %w", file.LocalPath, fileDirectory, err)
-		}
-		uploaded++
-		uploadedFiles = append(uploadedFiles, file)
 	}
 	c.consumeAvailableBytes(target, uploadedFiles)
 	appendUploadMap(target.Provider, selected.email, uploadedFiles)
 	return uploaded, nil
+}
+
+type uploadRootGroup struct {
+	root  string
+	files []UploadItem
+}
+
+func groupUploadItemsByRoot(files []UploadItem) []uploadRootGroup {
+	indexByRoot := map[string]int{}
+	var groups []uploadRootGroup
+	for _, file := range files {
+		root := localRootForUploadItem(file)
+		if index, ok := indexByRoot[root]; ok {
+			groups[index].files = append(groups[index].files, file)
+			continue
+		}
+		indexByRoot[root] = len(groups)
+		groups = append(groups, uploadRootGroup{
+			root:  root,
+			files: []UploadItem{file},
+		})
+	}
+	return groups
+}
+
+func localRootForUploadItem(file UploadItem) string {
+	root := filepath.Clean(file.LocalPath)
+	rel := filepath.Clean(file.RelativePath)
+	for rel != "." && rel != string(filepath.Separator) && rel != "" {
+		root = filepath.Dir(root)
+		rel = filepath.Dir(rel)
+	}
+	return root
+}
+
+func writeFilesFromList(files []UploadItem) (string, error) {
+	tempFile, err := os.CreateTemp("", "all-for-one-files-from-*.txt")
+	if err != nil {
+		return "", fmt.Errorf("create files-from list: %w", err)
+	}
+	path := tempFile.Name()
+	for _, file := range files {
+		line := filepath.ToSlash(filepath.Clean(file.RelativePath))
+		if _, err := fmt.Fprintln(tempFile, line); err != nil {
+			tempFile.Close()
+			os.Remove(path)
+			return "", fmt.Errorf("write files-from list: %w", err)
+		}
+	}
+	if err := tempFile.Close(); err != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("close files-from list: %w", err)
+	}
+	return path, nil
 }
 
 // appendUploadMap writes folder~storage~email entries for a successful upload batch.
