@@ -101,6 +101,22 @@ func ensureEOF(decoder *json.Decoder) error {
 	return errors.New("config contains multiple JSON values")
 }
 
+// PathNextToExecutable returns <exeDir>/all-for-one.config.jsonc.
+func PathNextToExecutable() (string, error) {
+	applog.Entry("config", "PathNextToExecutable", "start")
+	executable, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(filepath.Dir(executable), "all-for-one.config.jsonc")
+	applog.Entry("config", "PathNextToExecutable", "path=%s", path)
+	return path, nil
+}
+
 func resolvePath(baseDir, path string) string {
 	applog.Entry("config", "resolvePath", "baseDir=%s path=%s", baseDir, path)
 	if path == "" || filepath.IsAbs(path) {

@@ -47,7 +47,7 @@ func run() (runErr error) {
 	}()
 
 	applog.Entry("convert-and-upload", "run", "start")
-	defaultConfig, err := configPathNextToExecutable()
+	defaultConfig, err := config.PathNextToExecutable()
 	if err != nil {
 		return fmt.Errorf("resolve default config path: %w", err)
 	}
@@ -590,21 +590,6 @@ func clearDirectory(path string) error {
 		return err
 	}
 	return os.MkdirAll(path, 0o755)
-}
-
-func configPathNextToExecutable() (string, error) {
-	applog.Entry("convert-and-upload", "configPathNextToExecutable", "start")
-	executable, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	executable, err = filepath.EvalSymlinks(executable)
-	if err != nil {
-		return "", err
-	}
-	path := filepath.Join(filepath.Dir(executable), "all-for-one.config.jsonc")
-	applog.Entry("convert-and-upload", "configPathNextToExecutable", "path=%s", path)
-	return path, nil
 }
 
 func printImageProgress(progress imageconverter.Progress) {
