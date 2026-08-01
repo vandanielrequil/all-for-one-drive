@@ -29,6 +29,7 @@ go.work.sum
 *.oauth-token
 *.otp
 availability.log
+all-for-one-map.txt
 
 # Editor/IDE
 # .idea/

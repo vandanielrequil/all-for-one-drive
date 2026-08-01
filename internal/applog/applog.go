@@ -16,6 +16,7 @@ var (
 	writer           io.Writer
 	file             *os.File
 	availabilityFile *os.File
+	mapFile          *os.File
 	errorPath        string
 )
 
@@ -33,6 +34,7 @@ func Init() error {
 	executableDir := filepath.Dir(executable)
 	logPath := filepath.Join(executableDir, baseName+".log")
 	availabilityPath := filepath.Join(executableDir, "availability.log")
+	mapPath := filepath.Join(executableDir, "all-for-one-map.txt")
 	errorPath = filepath.Join(executableDir, baseName+".error")
 	if err := os.Remove(errorPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove previous error marker %q: %w", errorPath, err)
@@ -51,19 +53,27 @@ func Init() error {
 		logFile.Close()
 		return fmt.Errorf("open availability log %q: %w", availabilityPath, err)
 	}
+	uploadMap, err := os.OpenFile(mapPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		logFile.Close()
+		availabilityLog.Close()
+		return fmt.Errorf("open upload map %q: %w", mapPath, err)
+	}
 
 	mu.Lock()
 	file = logFile
 	availabilityFile = availabilityLog
+	mapFile = uploadMap
 	writer = io.MultiWriter(os.Stdout, logFile)
 	mu.Unlock()
 
 	Entry(
 		"applog",
 		"Init",
-		"logPath=%s availabilityPath=%s errorPath=%s",
+		"logPath=%s availabilityPath=%s mapPath=%s errorPath=%s",
 		logPath,
 		availabilityPath,
+		mapPath,
 		errorPath,
 	)
 	return nil
@@ -80,8 +90,12 @@ func Close() error {
 	if availabilityFile != nil {
 		err = errors.Join(err, availabilityFile.Close())
 	}
+	if mapFile != nil {
+		err = errors.Join(err, mapFile.Close())
+	}
 	file = nil
 	availabilityFile = nil
+	mapFile = nil
 	writer = nil
 	return err
 }
@@ -119,6 +133,16 @@ func Availability(format string, args ...any) {
 	defer mu.Unlock()
 	if availabilityFile != nil {
 		fmt.Fprintln(availabilityFile, line)
+	}
+}
+
+// UploadMap appends one line to all-for-one-map.txt.
+func UploadMap(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	mu.Lock()
+	defer mu.Unlock()
+	if mapFile != nil {
+		fmt.Fprintln(mapFile, line)
 	}
 }
 

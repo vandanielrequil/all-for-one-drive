@@ -87,6 +87,7 @@ type remote struct {
 	maxUsageBytes  int64
 	maxFileBytes   int64
 	availableBytes *int64
+	email          string
 	cloudName      string
 	apiKey         string
 	apiSecret      string
@@ -625,6 +626,7 @@ func (c *Client) UploadItems(
 	for _, file := range files {
 		if selected.maxFileBytes > 0 && file.Size > selected.maxFileBytes {
 			c.consumeAvailableBytes(target, uploadedFiles)
+			appendUploadMap(target.Provider, selected.email, uploadedFiles)
 			return uploaded, fmt.Errorf(
 				"file %q (%s) exceeds maxFileSizeMB=%d",
 				file.LocalPath,
@@ -648,6 +650,7 @@ func (c *Client) UploadItems(
 					"mkdir", fileDirectory,
 				); err != nil {
 					c.consumeAvailableBytes(target, uploadedFiles)
+					appendUploadMap(target.Provider, selected.email, uploadedFiles)
 					return uploaded, fmt.Errorf("create remote directory %q: %w", fileDirectory, err)
 				}
 				createdDirectories[fileDirectory] = struct{}{}
@@ -668,13 +671,72 @@ func (c *Client) UploadItems(
 		}
 		if err := c.runStreamingForRemote(ctx, selected, "Upload", args...); err != nil {
 			c.consumeAvailableBytes(target, uploadedFiles)
+			appendUploadMap(target.Provider, selected.email, uploadedFiles)
 			return uploaded, fmt.Errorf("upload %q to %q: %w", file.LocalPath, fileDirectory, err)
 		}
 		uploaded++
 		uploadedFiles = append(uploadedFiles, file)
 	}
 	c.consumeAvailableBytes(target, uploadedFiles)
+	appendUploadMap(target.Provider, selected.email, uploadedFiles)
 	return uploaded, nil
+}
+
+// appendUploadMap writes folder~storage~email entries for a successful upload batch.
+// Folder = top-level dir under image/video tree; if files sit at root — first file name.
+func appendUploadMap(provider, email string, files []UploadItem) {
+	if len(files) == 0 {
+		return
+	}
+	keys := uploadMapFolderKeys(files)
+	if len(keys) == 0 {
+		return
+	}
+	if email == "" {
+		email = "-"
+	}
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"~"+provider+"~"+email)
+	}
+	line := strings.Join(parts, " ")
+	applog.UploadMap("%s", line)
+	applog.Entry("rclone", "appendUploadMap", "%s", line)
+}
+
+func uploadMapFolderKeys(files []UploadItem) []string {
+	seen := make(map[string]struct{})
+	keys := make([]string, 0)
+	rootFirst := ""
+	for _, file := range files {
+		relative := filepath.ToSlash(file.RelativePath)
+		relative = strings.TrimPrefix(relative, "./")
+		if relative == "" || relative == "." {
+			continue
+		}
+		slash := strings.IndexByte(relative, '/')
+		if slash < 0 {
+			if rootFirst == "" {
+				rootFirst = filepath.Base(relative)
+			}
+			continue
+		}
+		key := relative[:slash]
+		if key == "" || key == "." {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if rootFirst != "" {
+		if _, exists := seen[rootFirst]; !exists {
+			keys = append(keys, rootFirst)
+		}
+	}
+	return keys
 }
 
 func (c *Client) consumeAvailableBytes(target Target, files []UploadItem) {
@@ -1193,6 +1255,7 @@ func buildConfig(config Config) (map[Target]remote, []byte, error) {
 				archives:      provider.AcceptsArchives,
 				maxUsageBytes: provider.MaxUsageMB * 1024 * 1024,
 				maxFileBytes:  provider.MaxFileSizeMB * 1024 * 1024,
+				email:         strings.TrimSpace(account.Email),
 				cloudName:     account.Options["cloud_name"],
 				apiKey:        account.Options["api_key"],
 				apiSecret:     account.Options["api_secret"],

@@ -251,7 +251,11 @@ cd bin
 |---|---|
 | `convert-and-upload.log` | полный лог; **очищается** каждый запуск |
 | `availability.log` | таблица квот/статусов; **дописывается** |
+| `all-for-one-map.txt` | карта загрузок: `папка~хранилище~email` через пробел; **дописывается** после каждой загрузки |
 | `convert-and-upload.error` | появляется только при ошибке; при старте удаляется |
+
+Пример строки карты: `test1~google-drive~vandaniel1994usa@gmail.com test2~mega~vandaniel1994usa@gmail.com`  
+Имя папки — верхний уровень внутри `image-input`/`video-input`; если файлы лежали в корне — имя первого файла.
 
 ---
 
