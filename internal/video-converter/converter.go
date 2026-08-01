@@ -274,7 +274,7 @@ func (c *Converter) probeVideoSize(ctx context.Context, sourcePath string) (int,
 		"-v", "error",
 		"-select_streams", "v:0",
 		"-show_entries", "stream=width,height",
-		"-of", "csv=p=0:s=x",
+		"-of", "csv=p=0",
 		sourcePath,
 	)
 	var stdout bytes.Buffer
@@ -285,18 +285,32 @@ func (c *Converter) probeVideoSize(ctx context.Context, sourcePath string) (int,
 	if err != nil {
 		return 0, 0, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
 	}
-	output := stdout.Bytes()
-	parts := strings.Split(strings.TrimSpace(string(output)), "x")
-	if len(parts) != 2 {
+	output := strings.TrimSpace(string(stdout.Bytes()))
+	// Pixel phones / some ffprobe builds append trailing separators ("1920,1080," or "1920x1080x").
+	fields := strings.FieldsFunc(output, func(r rune) bool {
+		return r == ',' || r == 'x' || r == '\t' || r == ' '
+	})
+	nums := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		nums = append(nums, field)
+	}
+	if len(nums) < 2 {
 		return 0, 0, fmt.Errorf("unexpected ffprobe output: %q", output)
 	}
-	width, err := strconv.Atoi(parts[0])
+	width, err := strconv.Atoi(nums[0])
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("parse width from %q: %w", output, err)
 	}
-	height, err := strconv.Atoi(parts[1])
+	height, err := strconv.Atoi(nums[1])
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("parse height from %q: %w", output, err)
+	}
+	if width <= 0 || height <= 0 {
+		return 0, 0, fmt.Errorf("invalid video size %dx%d from %q", width, height, output)
 	}
 	return width, height, nil
 }
