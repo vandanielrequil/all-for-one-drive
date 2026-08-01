@@ -50,6 +50,7 @@ go mod download
 # собрать бинарники
 mkdir bin -Force
 go build -o .\bin\convert-and-upload.exe .\cmd\convert-and-upload
+go build -o .\bin\convert.exe .\cmd\convert
 go build -o .\bin\precheck.exe .\cmd\precheck
 
 # рабочий конфиг рядом с exe (шаблон в корне репо)
@@ -63,6 +64,7 @@ Copy-Item .\all-for-one.config.jsonc .\bin\all-for-one.config.jsonc
 ```text
 bin/
   convert-and-upload.exe
+  convert.exe                   ← только конвертация фото/видео
   precheck.exe                  ← только PreCheck облаков
   all-for-one.config.jsonc      ← ваш конфиг с credentials
   image-input/                  ← сюда кладёте фото
@@ -72,6 +74,7 @@ bin/
   archive-output/               ← архивы (если archive: true)
   upload-output/                ← staging без архивов
   convert-and-upload.log        ← лог текущего запуска (очищается каждый раз)
+  convert.log                   ← лог отдельной конвертации
   precheck.log                  ← лог отдельного PreCheck
   availability.log              ← таблица PreCheck (дописывается)
   *.oauth-token                 ← OAuth refresh tokens (не коммитить)
@@ -240,11 +243,16 @@ cd bin
 # или
 .\convert-and-upload.exe -config D:\path\to\all-for-one.config.jsonc
 
+# только конвертация фото/видео → image-output / video-output
+.\convert.exe
+.\convert.exe -config D:\path\to\all-for-one.config.jsonc
+
 # только проверка облаков / квот (без конвертации и upload)
 .\precheck.exe
 .\precheck.exe -config D:\path\to\all-for-one.config.jsonc
 ```
 
+`convert.exe` — только image/video converter, без PreCheck, архивов и upload.  
 `precheck.exe` пишет ту же таблицу в `availability.log` и выходит с ошибкой, если хотя бы один аккаунт не прошёл логин.  
 Если у `convert-and-upload` вход пустой, PreCheck всё равно выполнится и допишет `availability.log`, upload не стартует.
 
@@ -291,6 +299,7 @@ cd bin
 
 ```text
 cmd/convert-and-upload/     — оркестратор (convert → archive → upload)
+cmd/convert/                — только конвертация фото/видео
 cmd/precheck/               — только PreCheck облаков → availability.log
 internal/
   applog/                   — логи, .error, availability.log
